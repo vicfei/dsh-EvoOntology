@@ -157,6 +157,40 @@ def trajectory_count():
     return len([f for f in os.listdir(d) if f.endswith(".json")]) if os.path.isdir(d) else 0
 
 
+# ── threshold trigger (issue #3, pure) ───────────────────────────────────────
+
+def trigger_state():
+    """Persisted under <workspace>/state.json: cheap, predictable, inspectable."""
+    path = os.path.join(ws(), "state.json")
+    return json.load(open(path)) if os.path.exists(path) else {}
+
+
+def trigger_due(state, trajectory_count, now=None, min_trajectories=10, min_days=7):
+    """Evolve after N new trajectories or M days since the last evolution —
+    deterministic: same inputs, same verdict, same reason string."""
+    now = now or dt.datetime.now()
+    last = state.get("last_evolution_at")
+    last_count = state.get("trajectory_count_at_last", 0)
+    new_since = trajectory_count - last_count
+    if new_since >= min_trajectories:
+        return True, f"due: {new_since} new trajectories (threshold {min_trajectories})"
+    if last is None and trajectory_count > 0:
+        return True, "due: first evolution with a non-empty corpus"
+    if last is not None:
+        days = (now - dt.datetime.fromisoformat(last)).days
+        if days >= min_days and new_since > 0:
+            return True, f"due: {days} days elapsed with {new_since} new trajectories"
+    return False, (f"not due: {new_since}/{min_trajectories} new trajectories"
+                   if last is not None else "not due: empty corpus")
+
+
+def trigger_mark(state):
+    state["last_evolution_at"] = dt.datetime.now().isoformat(timespec="seconds")
+    state["trajectory_count_at_last"] = trajectory_count()
+    json.dump(state, open(os.path.join(ws(), "state.json"), "w"), indent=1)
+    return state
+
+
 # ── CLI ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -171,6 +205,10 @@ def main():
     add = rsub.add_parser("add")
     add.add_argument("--json", required=True, help="record payload JSON (id/recorded_at auto-filled)")
     rsub.add_parser("list")
+    tg = sub.add_parser("trigger")
+    tg.add_argument("--trajectories", type=int, default=10, help="N new trajectories to trigger (default 10)")
+    tg.add_argument("--days", type=int, default=7, help="M days to trigger (default 7)")
+    tg.add_argument("--mark", action="store_true", help="record that an evolution just ran")
     tr = sub.add_parser("trajectory")
     tsub = tr.add_subparsers(dest="tcmd", required=True)
     tadd = tsub.add_parser("append")
@@ -202,6 +240,16 @@ def main():
             else:
                 print(f"✓ {p} conforms ({kind}, {FORMAT_VERSION})")
         sys.exit(1 if bad else 0)
+
+    if args.cmd == "trigger":
+        state = trigger_state()
+        if args.mark:
+            trigger_mark(state)
+            print(tt(f"marked: last_evolution_at={state['last_evolution_at']} · counted {state['trajectory_count_at_last']}",
+                     f"已标记：last_evolution_at={state['last_evolution_at']} · 计 {state['trajectory_count_at_last']} 条"))
+        else:
+            due, why = trigger_due(state, trajectory_count(), min_trajectories=args.trajectories, min_days=args.days)
+            print(("▲ " if due else "· ") + why)
 
     if args.cmd == "trajectory":
         if args.tcmd == "append":
