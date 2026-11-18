@@ -19,13 +19,18 @@ CI gates from day one, evidence on every record, honest metrics reported as-is.
 
 ## E1 · Evolution kernel (phase C core)
 
-- [ ] Five-record store (#1): evidence-linked JSON store (append-only records,
-      id-referenced Evidence with verbatim spans), format versioned as the
-      evidence-linked family format; stdlib validator + CI enforcement.
-- [ ] Trajectory store (#2): append-only per-task records (decisions, outcomes,
-      quotes, provenance: model/calls/tokens/elapsed) — the corpus agents write.
-- [ ] Threshold trigger (#3): evolve after N new trajectories or M days
-      (configurable, state persisted); cheap and predictable.
+- [x] Five-record store (2026-11-19, PR #19): Term/Mapping/Relation/Constraint/
+      Evidence in append-only JSONL (<workspace>/.evo, EVO_HOME); dual evidence
+      representation (inline span OR evidence_ids); the validator also accepts
+      sibling v0.1 ontology artifacts — one family, one evidence contract; ghost
+      records rejected at add time; CI: pure semantics + clean-workspace CLI e2e.
+- [x] Trajectory store (2026-11-19, PR #20): <workspace>/trajectories/<task_id>.json;
+      agent + summary required; task_id/recorded_at auto-filled; provenance passthrough;
+      append-only enforced (duplicate task_id rejected, never silently overwritten).
+- [x] Threshold trigger (2026-11-19, PR #21): deterministic (state, count, now) →
+      (due, reason); three paths — first-evolution bootstrap (non-empty corpus with no
+      prior state), volume (≥ N new), time (≥ M days AND new material — never an empty
+      spin); state.json persisted; --mark records an evolution ran.
 - [ ] Evolution session (#4): hypothesis-framed rounds, candidate versions with
       parent lineage (`layer_vN`), **frozen budget** (exhaustion = incomplete;
       extension requires explicit user confirmation), atomic writes, resume.
