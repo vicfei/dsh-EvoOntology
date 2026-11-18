@@ -98,6 +98,42 @@ jobs:
           d, w = M.trigger_due(st2, 12, now=now, min_days=7); assert not d
           print("trigger: PASS")
           EOF
+      - name: evolution session + gate (pure, no network)
+        run: |
+          python3 - <<'EOF'
+          import importlib.util, os, sys, tempfile, time
+          os.environ["EVO_HOME"] = tempfile.mkdtemp()
+          sys.path.insert(0, "scripts")
+          spec = importlib.util.spec_from_file_location("ev", "scripts/evoontology.py")
+          M = importlib.util.module_from_spec(spec); spec.loader.exec_module(M)
+          M.WORKSPACE = os.environ["EVO_HOME"]
+          E = {"id":"ev1","type":"Evidence","recorded_at":"t","quote":"q","source":"s"}
+          T = {"id":"t1","type":"Term","recorded_at":"t","name":"Rev","evidence_ids":["ev1"]}
+          T_ghost = {"id":"t2","type":"Term","recorded_at":"t","name":"Ghost"}
+          good = M.evaluation_score([E, T]); ghost = M.evaluation_score([E, T, T_ghost])
+          assert good["total"] > ghost["total"]
+          assert M.gate_decides(good, ghost) and not M.gate_decides(good, good)
+          M.snapshot_version(0, [E], note="seed")
+          assert M.latest_version() == 0
+          try: M.snapshot_version(0, [E]); assert False
+          except SystemExit: pass
+          for i in range(3):
+              M.trajectory_append({"agent":"t","summary":f"s{i}"}); time.sleep(0.02)
+          run = M.run_start("add Term", budget=2)
+          run, rec = M.run_round([E, T])
+          assert rec["won"] and run["status"] == "completed" and run["accepted_version"] == 1
+          run2 = M.run_start("try ghost", budget=1)
+          run2, rec2 = M.run_round([E, T, T_ghost])
+          assert not rec2["won"] and run2["status"] == "running"
+          try:
+              run2, _ = M.run_round([E, T], run=run2); assert False
+          except SystemExit: pass
+          reloaded = M.run_load(run2["run_id"])
+          assert reloaded["status"] == "incomplete" and reloaded["incomplete_reason"] == "budget_exhausted"
+          ext = M.run_extend(run2["run_id"], extra=1)
+          assert ext["status"] == "running" and ext["budget"]["max_rounds"] == 2
+          print("session + gate: PASS")
+          EOF
       - name: CLI end-to-end on a clean workspace
         run: |
           mkdir -p /tmp/ws && cd /tmp/ws
