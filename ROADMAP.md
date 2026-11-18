@@ -34,14 +34,17 @@ CI gates from day one, evidence on every record, honest metrics reported as-is.
 - [ ] Evolution session (#4): hypothesis-framed rounds, candidate versions with
       parent lineage (`layer_vN`), **frozen budget** (exhaustion = incomplete;
       extension requires explicit user confirmation), atomic writes, resume.
-- [ ] Evaluation gate (#5): adapter contract (evaluate a candidate vs incumbent,
-      comparable results) + a seeded honest eval as the first adapter; nothing
-      publishes without winning.
-- [ ] SQLite semantic seed (#6): minimal Term→table/column records over one
-      SQLite database — the README's live promise of phase A.
-- [ ] CLI + CI + npm 0.1.0 vehicle (#7): EN-first engine, the family's proven
-      distribution pattern (bin + skill + empty patch), every CI gate the
-      family paid for.
+- [x] Evaluation gate (2026-11-19, PR #23): the first adapter is fully deterministic
+      (evidence coverage + cleanliness 1/(1+violations) + type diversity); strict
+      publishing: candidate.total > incumbent.total (ties keep the incumbent).
+      Ghost records lower the score; zero LLM.
+- [x] SQLite semantic seed (2026-11-19, PR #24): sqlite_master DDL → Term+Mapping
+      per column, evidence = verbatim CREATE TABLE; deterministic (same DB same
+      records, zero LLM); CI-tested.
+- [x] CLI + CI + npm 0.1.0 vehicle (2026-11-19, PR #25): bin 'evoontology' + skill +
+      empty patch (typed-tools is 0.2.0 #11); CI: syntax + record/trajectory/trigger/
+      session+gate/seed pure tests + node --check bin + pack clean; fresh-install
+      smoke verified (seed/validate/trigger/record list).
 
 ## E2 · Family integration (phase C proof of generality)
 
