@@ -1,0 +1,57 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: engine syntax
+        run: python3 -m py_compile scripts/evoontology.py
+      - name: record store semantics (pure, no network)
+        run: |
+          python3 - <<'EOF'
+          import importlib.util, json, sys
+          sys.path.insert(0, "scripts")
+          spec = importlib.util.spec_from_file_location("ev", "scripts/evoontology.py")
+          M = importlib.util.module_from_spec(spec); spec.loader.exec_module(M)
+          E = {"id": "ev1", "type": "Evidence", "recorded_at": "t", "quote": "CREATE TABLE t(x INT)", "source": "schema.sql"}
+          T_ok = {"id": "t1", "type": "Term", "recorded_at": "t", "name": "Revenue",
+                  "evidence": [{"quote": "revenue column", "source": "ddl"}]}
+          T_ref = {"id": "t2", "type": "Term", "recorded_at": "t", "name": "Churn", "evidence_ids": ["ev1"]}
+          T_noev = {"id": "t3", "type": "Term", "recorded_at": "t", "name": "Ghost"}
+          T_dangling = {"id": "t4", "type": "Term", "recorded_at": "t", "name": "X", "evidence_ids": ["ev404"]}
+          M_bad = {"id": "m1", "type": "Mapping", "recorded_at": "t", "evidence": [{"quote": "q", "source": "s"}]}
+          R_bad = {"id": "r1", "type": "Relation", "recorded_at": "t", "subject": "a", "predicate": "p",
+                   "evidence": [{"quote": "q", "source": "s"}]}
+          assert M.validate_records([E, T_ok, T_ref]) == []
+          assert any("no evidence" in e for e in M.validate_records([T_noev]))
+          assert any("do not reference" in e for e in M.validate_records([T_dangling]))
+          assert any("Mapping needs" in e for e in M.validate_records([M_bad]))
+          assert any("Relation needs" in e for e in M.validate_records([R_bad]))
+          assert any("duplicate id" in e for e in M.validate_records([T_ok, dict(T_ok)]))
+          v01 = {"domain": "x", "built_at": "t", "tbox": {"entity_types": [{"name": "tool"}], "relation_types": []},
+                 "abox": {"entities": [{"name": "A", "type": "tool", "docs": ["d"], "evidences": [{"quote": "q", "doc": "d"}]}],
+                          "relations": [{"subject": "A", "predicate": "p", "object": "B", "docs": ["d"], "evidences": [{"quote": "r", "doc": "d"}]}]},
+                 "stats": {"entities": 1, "relations": 1}}
+          assert M.validate_v01_artifact(v01) == []
+          bad_v01 = json.loads(json.dumps(v01)); bad_v01["abox"]["entities"][0]["evidences"] = []
+          assert M.validate_v01_artifact(bad_v01)
+          print("record store: PASS")
+          EOF
+      - name: CLI end-to-end on a clean workspace
+        run: |
+          mkdir -p /tmp/ws && cd /tmp/ws
+          echo '{"type":"Evidence","id":"ev1","quote":"CREATE TABLE rev(x INT)","source":"schema.sql"}' > /dev/null
+          python3 "$GITHUB_WORKSPACE/scripts/evoontology.py" record add --json '{"type":"Evidence","id":"ev1","recorded_at":"2026-11-19T00:00:00","quote":"CREATE TABLE rev(x INT)","source":"schema.sql"}'
+          python3 "$GITHUB_WORKSPACE/scripts/evoontology.py" record add --json '{"type":"Term","id":"t1","recorded_at":"2026-11-19T00:00:01","name":"Revenue","evidence_ids":["ev1"]}'
+          if python3 "$GITHUB_WORKSPACE/scripts/evoontology.py" record add --json '{"type":"Term","id":"t2","recorded_at":"2026-11-19T00:00:02","name":"Ghost"}'; then
+            echo "GHOST RECORD ACCEPTED — constitution violated"; exit 1
+          fi
+          python3 "$GITHUB_WORKSPACE/scripts/evoontology.py" validate .evo/records.jsonl
