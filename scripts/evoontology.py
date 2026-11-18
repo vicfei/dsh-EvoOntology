@@ -126,6 +126,37 @@ def record_add(payload):
     return rec
 
 
+# ── trajectory store (issue #2, pure) ────────────────────────────────────────
+
+def trajectory_dir():
+    d = os.path.join(ws(), "trajectories")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def trajectory_append(payload):
+    """One per-task record, append-only: what the agent did, verbatim.
+    Deterministic fields auto-filled (task_id, recorded_at); provenance
+    (model/calls/tokens/elapsed) passes through when the source carries it."""
+    rec = dict(payload)
+    if not rec.get("agent") or not rec.get("summary"):
+        sys.exit(tt("trajectory needs at least agent + summary (what ran, what happened)",
+                    "轨迹至少需要 agent + summary（谁跑的、结果如何）"))
+    rec.setdefault("task_id", f"traj_{dt.datetime.now().strftime('%H%M%S%f')[:10]}")
+    rec.setdefault("recorded_at", dt.datetime.now().isoformat(timespec="seconds"))
+    path = os.path.join(trajectory_dir(), rec["task_id"] + ".json")
+    if os.path.exists(path):
+        sys.exit(tt(f"task_id {rec['task_id']} already exists — trajectories are append-only, pick a new id",
+                    f"task_id {rec['task_id']} 已存在——轨迹 append-only，请换新 id"))
+    json.dump(rec, open(path, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    return rec
+
+
+def trajectory_count():
+    d = trajectory_dir()
+    return len([f for f in os.listdir(d) if f.endswith(".json")]) if os.path.isdir(d) else 0
+
+
 # ── CLI ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -140,6 +171,11 @@ def main():
     add = rsub.add_parser("add")
     add.add_argument("--json", required=True, help="record payload JSON (id/recorded_at auto-filled)")
     rsub.add_parser("list")
+    tr = sub.add_parser("trajectory")
+    tsub = tr.add_subparsers(dest="tcmd", required=True)
+    tadd = tsub.add_parser("append")
+    tadd.add_argument("--json", required=True, help="trajectory payload (agent+summary required; task_id/recorded_at auto)")
+    tsub.add_parser("count")
     args = ap.parse_args()
     LANG = args.lang
 
@@ -166,6 +202,13 @@ def main():
             else:
                 print(f"✓ {p} conforms ({kind}, {FORMAT_VERSION})")
         sys.exit(1 if bad else 0)
+
+    if args.cmd == "trajectory":
+        if args.tcmd == "append":
+            rec = trajectory_append(json.loads(args.json))
+            print(f"+ {rec['task_id']} ({rec['agent']}) → {os.path.join(ws(), 'trajectories')}")
+        else:
+            print(trajectory_count())
 
     if args.cmd == "record":
         path = os.path.join(ws(), "records.jsonl")
