@@ -1,0 +1,11 @@
+{
+  "name": "dsh-evoontology",
+  "version": "0.0.1",
+  "description": "Self-evolving ontology layer for DeepSeek Harness — an evolution engine (trajectory store, threshold triggers, hypothesis rounds under a frozen budget, evaluation-gated publishing) with evidence on every record. Implements the concept of ruc-datalab/EvoOntology. Name reserved; first release in development.",
+  "keywords": ["deepseek-harness", "dsh", "dsh-plugin", "evoontology", "ontology", "self-evolving", "llm-agents", "evidence-grounding"],
+  "repository": {"type": "git", "url": "git+https://github.com/vicfei/dsh-EvoOntology.git"},
+  "homepage": "https://github.com/vicfei/dsh-EvoOntology#readme",
+  "bugs": {"url": "https://github.com/vicfei/dsh-EvoOntology/issues"},
+  "license": "MIT",
+  "author": "vicfei"
+}
