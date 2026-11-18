@@ -1,0 +1,7 @@
+# dsh-evoontology bundle layer.
+#
+# Deliberately inserts no plugin entry: this bundle is a distribution vehicle —
+# a skill (skills/dsh-evoontology/SKILL.md, discovered by dsh-skill-filesystem)
+# and a CLI (`evoontology`, npm bin) spawning the bundled Python kernel.
+# Typed-tools is the 0.2.0 track (issue #11).
+[]
