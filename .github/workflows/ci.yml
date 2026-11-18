@@ -67,6 +67,37 @@ jobs:
           assert M.trajectory_count() == 2
           print("trajectory store: PASS")
           EOF
+      - name: trigger semantics (pure, no network)
+        run: |
+          python3 - <<'EOF'
+          import importlib.util, os, sys, tempfile, datetime as dt, time
+          os.environ["EVO_HOME"] = tempfile.mkdtemp()
+          sys.path.insert(0, "scripts")
+          spec = importlib.util.spec_from_file_location("ev", "scripts/evoontology.py")
+          M = importlib.util.module_from_spec(spec); spec.loader.exec_module(M)
+          M.WORKSPACE = os.environ["EVO_HOME"]
+          now = dt.datetime(2026, 11, 19)
+          d, w = M.trigger_due({}, 0, now=now); assert not d and "empty" in w
+          d, w = M.trigger_due({}, 3, now=now); assert d and "first evolution" in w
+          M.trajectory_append({"agent": "a", "summary": "seed"})
+          M.trigger_mark({})
+          for i in range(8):
+              M.trajectory_append({"agent": "a", "summary": f"s{i}"}); time.sleep(0.02)
+          d, w = M.trigger_due(M.trigger_state(), M.trajectory_count(), now=now)
+          assert not d
+          M.trajectory_append({"agent": "a", "summary": "s9"}); time.sleep(0.02)
+          M.trajectory_append({"agent": "a", "summary": "s10"}); time.sleep(0.02)
+          d, w = M.trigger_due(M.trigger_state(), M.trajectory_count(), now=now)
+          assert d and "10 new trajectories" in w
+          M.trigger_mark({})
+          st = {"last_evolution_at": "2026-11-11T00:00:00", "trajectory_count_at_last": 11}
+          M.trajectory_append({"agent": "a", "summary": "later"}); time.sleep(0.02)
+          d, w = M.trigger_due(st, M.trajectory_count(), now=now, min_days=7)
+          assert d and "days elapsed" in w
+          st2 = {"last_evolution_at": "2026-11-11T00:00:00", "trajectory_count_at_last": 12}
+          d, w = M.trigger_due(st2, 12, now=now, min_days=7); assert not d
+          print("trigger: PASS")
+          EOF
       - name: CLI end-to-end on a clean workspace
         run: |
           mkdir -p /tmp/ws && cd /tmp/ws
