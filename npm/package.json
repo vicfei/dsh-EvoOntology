@@ -1,0 +1,49 @@
+{
+  "name": "dsh-evoontology",
+  "version": "0.1.0",
+  "description": "Self-evolving ontology layer for DeepSeek Harness — an evolution engine (trajectory store, threshold triggers, hypothesis rounds under a frozen budget, evaluation-gated publishing) with evidence on every record. Phase 1: the kernel + SQLite semantic seed.",
+  "type": "module",
+  "bin": {
+    "evoontology": "bin/evoontology.js"
+  },
+  "scripts": {
+    "prepack": "node build.mjs"
+  },
+  "engines": {
+    "node": "^20.19.0 || >=22.0.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "manifestVersion": 1
+  },
+  "files": [
+    "bin",
+    "skills",
+    "scripts",
+    "cordis.patch.yml",
+    "build.mjs",
+    "LICENSE"
+  ],
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "evoontology",
+    "ontology",
+    "self-evolving",
+    "llm-agents",
+    "evidence-grounding"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vicfei/dsh-EvoOntology.git"
+  },
+  "homepage": "https://github.com/vicfei/dsh-EvoOntology#readme",
+  "bugs": {
+    "url": "https://github.com/vicfei/dsh-EvoOntology/issues"
+  },
+  "license": "MIT",
+  "author": "vicfei"
+}

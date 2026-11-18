@@ -134,6 +134,10 @@ jobs:
           assert ext["status"] == "running" and ext["budget"]["max_rounds"] == 2
           print("session + gate: PASS")
           EOF
+      - name: bin entry syntax (node --check)
+        run: node --check npm/bin/evoontology.js
+      - name: npm bundle packs clean
+        run: cd npm && npm pack --dry-run && rm -f *.tgz
       - name: sqlite seed (pure, no network)
         run: |
           python3 - <<'EOF'
