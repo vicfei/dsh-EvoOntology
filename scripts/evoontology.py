@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""evoontology — the self-evolution kernel for DeepSeek Harness (phase E1)
+
+Phase C core, deliberately ZERO-LLM: every mechanism here is deterministic and
+stdlib-only, testable in CI, demoable without an API key. The LLM enters only
+at the adapters (E2) and the semantic-layer build (E3).
+
+Record store (issue #1): an append-only JSONL of five record types — Term,
+Mapping, Relation, Constraint, Evidence — under <workspace>/records.jsonl.
+Evidence is the constitution, with a dual representation for a free bridge to
+the family formats:
+  - inline:  record.evidence = [{"quote": "...", "source": "..."}]
+  - by ref:  record.evidence_ids = [id, ...] pointing at Evidence records
+A record carrying neither is invalid ("no record without evidence").
+
+The validator also accepts the sibling format v0.1 ontology artifacts
+(domain/tbox/abox with inline spans) so dsh-auto-ontology files validate here
+unchanged — one family, one evidence contract.
+
+Usage:
+  python3 scripts/evoontology.py validate <paths...>        # records files AND/OR v0.1 artifacts
+  python3 scripts/evoontology.py record add --json '{"type":"Term",...}'
+  python3 scripts/evoontology.py record list [--type Term]
+"""
+import argparse, datetime as dt, json, os, sys
+
+KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LANG = os.environ.get("EVO_LANG") or "en"
+def tt(en, zh):
+    return en if LANG == "en" else zh
+
+WORKSPACE = os.environ.get("EVO_HOME") or os.path.join(os.getcwd(), ".evo")
+RECORD_TYPES = ("Term", "Mapping", "Relation", "Constraint", "Evidence")
+FORMAT_VERSION = "evidence-linked/v0.2"
+
+
+def ws():
+    os.makedirs(WORKSPACE, exist_ok=True)
+    return WORKSPACE
+
+
+# ── record store (pure; CI-tested) ──────────────────────────────────────────
+
+def _has_evidence(rec, evidence_ids):
+    inline = [e for e in rec.get("evidence", []) if isinstance(e, dict) and e.get("quote")]
+    return bool(inline) or any(i for i in rec.get("evidence_ids", []) if i in evidence_ids)
+
+
+def validate_records(records):
+    """Five-record conformance. Returns a list of violation strings (empty = ok)."""
+    v, ids, evidence_ids = [], set(), set()
+    for i, rec in enumerate(records):
+        rid = rec.get("id")
+        if not rid:
+            v.append(f"record[{i}]: missing id")
+        elif rid in ids:
+            v.append(f"record[{i}]: duplicate id {rid!r}")
+        else:
+            ids.add(rid)
+        if rec.get("type") not in RECORD_TYPES:
+            v.append(f"{rid or i}: type {rec.get('type')!r} not in {RECORD_TYPES}")
+            continue
+        if not rec.get("recorded_at"):
+            v.append(f"{rid}: missing recorded_at")
+        if rec["type"] == "Evidence":
+            if not (rec.get("quote") and rec.get("source")):
+                v.append(f"{rid}: Evidence needs quote + source")
+            else:
+                evidence_ids.add(rid)
+    for rec in records:
+        rid, rtype = rec.get("id", "?"), rec.get("type")
+        if rtype == "Evidence" or rtype not in RECORD_TYPES:
+            continue
+        if not _has_evidence(rec, evidence_ids):
+            v.append(f"{rid}: no evidence (inline quote or evidence_ids) — the constitution")
+        if rtype == "Term" and not rec.get("name"):
+            v.append(f"{rid}: Term needs a name")
+        if rtype == "Mapping" and not (rec.get("term") and rec.get("target")):
+            v.append(f"{rid}: Mapping needs term + target")
+        if rtype == "Relation" and not all(rec.get(k) for k in ("subject", "predicate", "object")):
+            v.append(f"{rid}: Relation needs subject/predicate/object")
+        if rtype == "Constraint" and not rec.get("rule"):
+            v.append(f"{rid}: Constraint needs a rule")
+        dangling = [i for i in rec.get("evidence_ids", []) if i not in evidence_ids and i not in ids]
+        # refs to non-Evidence ids are dangling; refs to Evidence ids collected above
+        ev_only = {r["id"] for r in records if r.get("type") == "Evidence"}
+        dangling = [i for i in rec.get("evidence_ids", []) if i not in ev_only]
+        if dangling:
+            v.append(f"{rid}: evidence_ids {dangling} do not reference Evidence records")
+    return v
+
+
+def validate_v01_artifact(o):
+    """Sibling-format acceptance: dsh-auto-ontology v0.1 ontology artifacts."""
+    v = []
+    for k in ("domain", "built_at", "tbox", "abox", "stats"):
+        if k not in o:
+            v.append(f"artifact missing key: {k}")
+    tbox_types = {t.get("name") for t in o.get("tbox", {}).get("entity_types", [])}
+    for e in o.get("abox", {}).get("entities", []):
+        if not (e.get("evidences") or [{}])[0].get("quote") and not e.get("evidence"):
+            v.append(f"entity {e.get('name')!r}: no evidence span")
+        if e.get("type") not in tbox_types:
+            v.append(f"entity {e.get('name')!r}: type not in tbox")
+    for r in o.get("abox", {}).get("relations", []):
+        if not (r.get("evidences") or [{}])[0].get("quote") and not r.get("evidence"):
+            v.append(f"relation {r.get('subject')}-{r.get('predicate')}: no evidence span")
+    return v
+
+
+def load_records(path):
+    return [json.loads(l) for l in open(path, encoding="utf-8") if l.strip()]
+
+
+def record_add(payload):
+    rec = dict(payload)
+    rec.setdefault("id", f"rec_{dt.datetime.now().strftime('%H%M%S%f')[:10]}")
+    rec.setdefault("recorded_at", dt.datetime.now().isoformat(timespec="seconds"))
+    errs = validate_records([rec] + load_records(os.path.join(ws(), "records.jsonl"))
+                             if os.path.exists(os.path.join(ws(), "records.jsonl")) else [rec])
+    blocking = [e for e in errs if rec["id"] in e]
+    if blocking:
+        sys.exit(tt("record rejected:\n  " + "\n  ".join(blocking), "记录被拒：\n  " + "\n  ".join(blocking)))
+    with open(os.path.join(ws(), "records.jsonl"), "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    return rec
+
+
+# ── CLI ─────────────────────────────────────────────────────────────────────
+
+def main():
+    global LANG
+    ap = argparse.ArgumentParser(prog="evoontology")
+    ap.add_argument("--lang", choices=("en", "zh"), default=LANG)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    v = sub.add_parser("validate")
+    v.add_argument("paths", nargs="+")
+    ra = sub.add_parser("record")
+    rsub = ra.add_subparsers(dest="rcmd", required=True)
+    add = rsub.add_parser("add")
+    add.add_argument("--json", required=True, help="record payload JSON (id/recorded_at auto-filled)")
+    rsub.add_parser("list")
+    args = ap.parse_args()
+    LANG = args.lang
+
+    if args.cmd == "validate":
+        bad = 0
+        for p in args.paths:
+            try:
+                text = open(p, encoding="utf-8").read()
+                if text.lstrip().startswith("{") and "domain" in text[:400] and "abox" in text[:2000]:
+                    errs = validate_v01_artifact(json.loads(text))
+                    kind = "v0.1 artifact"
+                else:
+                    errs = validate_records(load_records(p))
+                    kind = "records"
+            except Exception as exc:
+                print(f"✗ {p}: unreadable ({exc})")
+                bad += 1
+                continue
+            if errs:
+                bad += 1
+                print(f"✗ {p} ({kind}):")
+                for e in errs[:10]:
+                    print(f"  - {e}")
+            else:
+                print(f"✓ {p} conforms ({kind}, {FORMAT_VERSION})")
+        sys.exit(1 if bad else 0)
+
+    if args.cmd == "record":
+        path = os.path.join(ws(), "records.jsonl")
+        if args.rcmd == "add":
+            rec = record_add(json.loads(args.json))
+            print(f"+ {rec['id']} ({rec['type']}) → {path}")
+        else:  # list
+            if not os.path.exists(path):
+                print(tt("(no records yet)", "（暂无记录）"))
+                return
+            for rec in load_records(path):
+                ev = (rec.get("evidence") or [{}])[0].get("quote", "") or ",".join(rec.get("evidence_ids", []))
+                print(f"{rec['id']}  {rec['type']:<11} {str(rec.get('name') or rec.get('rule') or rec.get('predicate') or rec.get('quote'))[:38]:<38} | {ev[:40]}")
+
+
+if __name__ == "__main__":
+    main()
