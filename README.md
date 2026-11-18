@@ -48,8 +48,17 @@ layers; WrenAI answers questions through them).
 
 ## Status
 
-Phase E1 in development. See [ROADMAP](ROADMAP.md) for the issue-level plan;
-development runs issue → branch → PR with CI gates from day one.
+**Phase E1 complete** — the zero-LLM kernel ships:
+
+```bash
+npm i -g dsh-evoontology
+evoontology seed --sqlite mydata.db              # Term+Mapping from DDL, zero LLM
+evoontology evolve start --hypothesis "..."      # open a budgeted evolution run
+evoontology validate .evo/records.jsonl          # evidence-linked format conformance
+```
+
+See [ROADMAP](ROADMAP.md) for the full plan (E2 family integration → E3 semantic
+layer → E4 ecosystem).
 
 ## License
 
