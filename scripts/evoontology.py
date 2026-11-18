@@ -340,6 +340,52 @@ def run_extend(run_id=None, extra=2):
     return run
 
 
+# ── SQLite semantic seed (issue #6) — deterministic, zero LLM ──────────────────────────
+
+def sqlite_seed(db_path):
+    """Term + Mapping records from sqlite_master DDL — the phase-A promise live.
+    Each column becomes a Term; each column-to-table link a Mapping; evidence is
+    the verbatim CREATE TABLE statement. Deterministic: same DB, same records."""
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute("SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchall()
+    conn.close()
+    records, ts = [], dt.datetime.now().isoformat(timespec='seconds')
+    for tbl_name, ddl in rows:
+        if not ddl:
+            continue
+        cols = _parse_sqlite_cols(ddl)
+        for col in cols:
+            ev_id = f"seed_ev_{tbl_name}_{col}"
+            records.append({"id": ev_id, "type": "Evidence", "recorded_at": ts,
+                            "quote": ddl.strip()[:120], "source": f"sqlite:{db_path}#{tbl_name}"})
+            term_id = f"seed_t_{tbl_name}_{col}"
+            records.append({"id": term_id, "type": "Term", "recorded_at": ts,
+                            "name": f"{tbl_name}.{col}",
+                            "evidence_ids": [ev_id]})
+            records.append({"id": f"seed_m_{tbl_name}_{col}", "type": "Mapping", "recorded_at": ts,
+                            "term": term_id, "target": f"{tbl_name}.{col}",
+                            "evidence_ids": [ev_id]})
+    return records
+
+
+def _parse_sqlite_cols(ddl):
+    """Extract column names from CREATE TABLE DDL (first-pass: between the outer parens)."""
+    import re
+    inner = re.search(r"\((.*)\)", ddl, re.S)
+    if not inner:
+        return []
+    cols = []
+    for part in inner.group(1).split(','):
+        part = part.strip()
+        if not part or part.upper().startswith(("PRIMARY", "FOREIGN", "UNIQUE", "CHECK", "CONSTRAINT")):
+            continue
+        m = re.match(r'["\[`\]]?(\w+)', part)
+        if m:
+            cols.append(m.group(1))
+    return cols
+
+
 # ── CLI ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -354,6 +400,8 @@ def main():
     add = rsub.add_parser("add")
     add.add_argument("--json", required=True, help="record payload JSON (id/recorded_at auto-filled)")
     rsub.add_parser("list")
+    sd = sub.add_parser("seed")
+    sd.add_argument("--sqlite", required=True, help="path to a .db/.sqlite file")
     ev = sub.add_parser("evolve")
     esub = ev.add_subparsers(dest="ecmd", required=True)
     estart = esub.add_parser("start")
@@ -402,6 +450,12 @@ def main():
             else:
                 print(f"✓ {p} conforms ({kind}, {FORMAT_VERSION})")
         sys.exit(1 if bad else 0)
+
+    if args.cmd == "seed":
+        recs = sqlite_seed(args.sqlite)
+        for r in recs:
+            record_add(r)
+        print(f"seeded {len(recs)} records from {args.sqlite} ({len(recs)//3} columns x 3 records each)")
 
     if args.cmd == "evolve":
         if args.ecmd == "start":
