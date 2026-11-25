@@ -10,9 +10,10 @@ is the gate.
 
 ## Status
 
-Phase E1 (the kernel) in development — trajectory store, threshold trigger,
+Phase E1 (the kernel) shipped — trajectory store, threshold trigger,
 hypothesis rounds with a frozen budget, evaluation gate, and a SQLite semantic
-seed. See [ROADMAP](ROADMAP.md).
+seed. E2's first adapter is in: the dsh-auto-ontology adapter
+(`trajectory import` + `adapt auto-ontology`). See [ROADMAP](ROADMAP.md).
 
 ## The covenant
 
@@ -22,4 +23,6 @@ seed. See [ROADMAP](ROADMAP.md).
   incomplete and extension is an explicit human act;
 - A candidate publishes only by winning an evaluation — rerunnable, seeded,
   reported as-is;
-- No record without a verbatim source span.
+- No record without a verbatim source span;
+- A verdict rides on the record it was given for and is never rewritten — a
+  later judge adds a quote, it does not edit one.

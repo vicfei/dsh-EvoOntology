@@ -31,9 +31,9 @@ CI gates from day one, evidence on every record, honest metrics reported as-is.
       (due, reason); three paths — first-evolution bootstrap (non-empty corpus with no
       prior state), volume (≥ N new), time (≥ M days AND new material — never an empty
       spin); state.json persisted; --mark records an evolution ran.
-- [ ] Evolution session (#4): hypothesis-framed rounds, candidate versions with
-      parent lineage (`layer_vN`), **frozen budget** (exhaustion = incomplete;
-      extension requires explicit user confirmation), atomic writes, resume.
+- [x] Evolution session (#4) (2026-11-19, PR #23): hypothesis-framed rounds,
+      candidate versions with parent lineage (`layer_vN`), **frozen budget**
+      (exhaustion = incomplete; extension requires explicit user confirmation).
 - [x] Evaluation gate (2026-11-19, PR #23): the first adapter is fully deterministic
       (evidence coverage + cleanliness 1/(1+violations) + type diversity); strict
       publishing: candidate.total > incumbent.total (ties keep the incumbent).
@@ -50,8 +50,27 @@ CI gates from day one, evidence on every record, honest metrics reported as-is.
 
 - [ ] Adapter: dsh-TradingAgents verdict ledger (#8) — its settle/reflection
       loop becomes a trajectory source; evolution rounds over verdict lessons.
-- [ ] Adapter: dsh-auto-ontology certifications (#9) — accepted/rejected
-      verdicts as trajectory records; the ontology evolves under the same gate.
+- [x] Adapter: dsh-auto-ontology (#9) (2026-11-25, PR #27): its
+      `ao-trajectory/0.1` export imports as trajectories (idempotent by event
+      id) and projects to a layer where every record carries its quotes with
+      their verdicts; accepted/rejected certifications ride along (a reject
+      becomes a Constraint). One hypothesis round: a proposer re-types the terms
+      no quote grounds, the sibling's **own eval CLI** judges, the gate adds an
+      `endorsed` term; the round trip is `auto-ontology apply --proposals`
+      (recorded certification + new assertion, never a silent edit). Kernel
+      stays zero-LLM; the model calls live in `scripts/adapter_autoontology.py`.
+      First live round (2026-11-25, one stream of 374 events, 47 terms to
+      propose for): attempt 1 crashed before the judge (adapter bug, run closed
+      `aborted`); round 1 lost, 0 of 10 judged proposals grounded; round 2 —
+      reached through a budget extension issued by an agent, not a human, and
+      published as such — won on 1 of 13 and published `layer_v1`. The trip
+      back measured 2.9681 against a published 2.9693 (one constraint record
+      missing from the candidate; fixed, CI asserts equality). README has all
+      three attempts; evidence in the sibling's `eval/live-round/`.
+- [x] Run hygiene (2026-11-25, PR #27): one stream, one run — an unchanged
+      stream never opens a second run on its own, another try is
+      `evolve extend --run --extra --note` recorded on the run; a crash closes
+      its run `aborted` with the reason; judge input and rows per round.
 - [ ] WrenAI boundary + optional adapter (#10): settle the family division
       (this engine evolves layers; WrenAI answers through them) before E3.
 - [ ] typed-tools plugin 0.2.0 (#11): `evolution_run` / `evolution_status` via
