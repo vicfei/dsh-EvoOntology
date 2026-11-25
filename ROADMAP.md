@@ -59,6 +59,18 @@ CI gates from day one, evidence on every record, honest metrics reported as-is.
       `endorsed` term; the round trip is `auto-ontology apply --proposals`
       (recorded certification + new assertion, never a silent edit). Kernel
       stays zero-LLM; the model calls live in `scripts/adapter_autoontology.py`.
+      First live round (2026-11-25, one stream of 374 events, 47 terms to
+      propose for): attempt 1 crashed before the judge (adapter bug, run closed
+      `aborted`); round 1 lost, 0 of 10 judged proposals grounded; round 2 —
+      reached through a budget extension issued by an agent, not a human, and
+      published as such — won on 1 of 13 and published `layer_v1`. The trip
+      back measured 2.9681 against a published 2.9693 (one constraint record
+      missing from the candidate; fixed, CI asserts equality). README has all
+      three attempts; evidence in the sibling's `eval/live-round/`.
+- [x] Run hygiene (2026-11-25, PR #27): one stream, one run — an unchanged
+      stream never opens a second run on its own, another try is
+      `evolve extend --run --extra --note` recorded on the run; a crash closes
+      its run `aborted` with the reason; judge input and rows per round.
 - [ ] WrenAI boundary + optional adapter (#10): settle the family division
       (this engine evolves layers; WrenAI answers through them) before E3.
 - [ ] typed-tools plugin 0.2.0 (#11): `evolution_run` / `evolution_status` via
