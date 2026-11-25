@@ -17,12 +17,21 @@ The validator also accepts the sibling format v0.1 ontology artifacts
 (domain/tbox/abox with inline spans) so dsh-auto-ontology files validate here
 unchanged — one family, one evidence contract.
 
+E2, the dsh-auto-ontology adapter (issue #9): its ao-trajectory/0.1 export
+imports as trajectories, idempotent by event id, and projects to a layer where
+every record carries the verdict its evidence earned (project_auto_ontology).
+The gate counts those verdicts: a layer publishes only if it is better
+endorsed, not just bigger. The model calls live in adapter_autoontology.py;
+this file stays callable without a key.
+
 Usage:
   python3 scripts/evoontology.py validate <paths...>        # records files AND/OR v0.1 artifacts
+  python3 scripts/evoontology.py trajectory import --from x.ndjson   # an ao-trajectory/0.1 export
+  python3 scripts/evoontology.py adapt auto-ontology --from x.ndjson  # one hypothesis round (E2)
   python3 scripts/evoontology.py record add --json '{"type":"Term",...}'
   python3 scripts/evoontology.py record list [--type Term]
 """
-import argparse, datetime as dt, json, os, sys
+import argparse, datetime as dt, hashlib, json, os, re, sys
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LANG = os.environ.get("EVO_LANG") or "en"
@@ -32,6 +41,7 @@ def tt(en, zh):
 WORKSPACE = os.environ.get("EVO_HOME") or os.path.join(os.getcwd(), ".evo")
 RECORD_TYPES = ("Term", "Mapping", "Relation", "Constraint", "Evidence")
 FORMAT_VERSION = "evidence-linked/v0.2"
+AO_SCHEMA = "ao-trajectory/0.1"      # what dsh-auto-ontology export writes
 
 
 def ws():
@@ -134,10 +144,12 @@ def trajectory_dir():
     return d
 
 
-def trajectory_append(payload):
+def trajectory_append(payload, if_exists="error"):
     """One per-task record, append-only: what the agent did, verbatim.
     Deterministic fields auto-filled (task_id, recorded_at); provenance
-    (model/calls/tokens/elapsed) passes through when the source carries it."""
+    (model/calls/tokens/elapsed) passes through when the source carries it.
+    if_exists="skip" returns None for a task_id already stored — an import
+    replay adds nothing instead of failing."""
     rec = dict(payload)
     if not rec.get("agent") or not rec.get("summary"):
         sys.exit(tt("trajectory needs at least agent + summary (what ran, what happened)",
@@ -146,6 +158,8 @@ def trajectory_append(payload):
     rec.setdefault("recorded_at", dt.datetime.now().isoformat(timespec="seconds"))
     path = os.path.join(trajectory_dir(), rec["task_id"] + ".json")
     if os.path.exists(path):
+        if if_exists == "skip":
+            return None
         sys.exit(tt(f"task_id {rec['task_id']} already exists — trajectories are append-only, pick a new id",
                     f"task_id {rec['task_id']} 已存在——轨迹 append-only，请换新 id"))
     json.dump(rec, open(path, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
@@ -155,6 +169,138 @@ def trajectory_append(payload):
 def trajectory_count():
     d = trajectory_dir()
     return len([f for f in os.listdir(d) if f.endswith(".json")]) if os.path.isdir(d) else 0
+
+
+def trajectories():
+    """Every stored trajectory in task_id order — stable whatever the append order."""
+    d = trajectory_dir()
+    return [json.load(open(os.path.join(d, f), encoding="utf-8"))
+            for f in sorted(os.listdir(d)) if f.endswith(".json")]
+
+
+def read_stream(path):
+    """An ao-trajectory/0.1 export (newline JSON) -> events; the schema is checked on every line."""
+    evs = []
+    with open(path, encoding="utf-8") as f:
+        for n, line in enumerate(f, 1):
+            if not line.strip():
+                continue
+            ev = json.loads(line)
+            if ev.get("schema") != AO_SCHEMA or not ev.get("id"):
+                sys.exit(tt(f"{path}:{n}: not an {AO_SCHEMA} event", f"{path}:{n}：不是 {AO_SCHEMA} 事件"))
+            evs.append(ev)
+    return evs
+
+
+def trajectory_import(path):
+    """An export -> trajectory records, idempotent by event id (the event id is the task_id):
+    what is already stored is skipped, never duplicated. -> (added, skipped)"""
+    added = skipped = 0
+    for ev in read_stream(path):
+        rec = trajectory_append(dict(ev, task_id=ev["id"], origin=os.path.basename(path)), if_exists="skip")
+        skipped, added = skipped + (rec is None), added + (rec is not None)
+    return added, skipped
+
+
+# ── the dsh-auto-ontology projection (issue #9, pure) ───────────────────────
+
+def _nk(s):
+    """Name key the way the sibling folds names: case/punctuation-insensitive, script-agnostic."""
+    return re.sub(r"[\W_]+", "", str(s).lower())
+
+
+def _h(*parts):
+    return hashlib.sha1("|".join(str(p) for p in parts).encode()).hexdigest()[:12]
+
+
+def project_auto_ontology(trajs):
+    """The layer an ao-trajectory store describes — a pure projection: same
+    trajectories, same records. One Term per (entity, type) and one Relation per
+    triple, each carrying its quotes WITH their verdicts (a verdict is a fact
+    about a quote, so evidence is never rewritten; a later judge simply adds a
+    quote). The latest certification on a name is the one in force: its reject
+    suppresses that typing and becomes a Constraint record, its accept endorses
+    it. A relation stays while either endpoint still has a typing. A conflict is
+    kept as an open Constraint. Record ids derive from the claim and the domain,
+    so a replay projects to the same layer. Types outside the TBox and
+    ungrounded clashes assert nothing and project to no record."""
+    terms, rels, certs, conflicts, builds = {}, {}, [], [], {}
+    for t in trajs:
+        if t.get("schema") != AO_SCHEMA:
+            continue                     # another agent's trajectory: not this adapter's
+        k, dom = t.get("kind"), t.get("domain") or "?"
+        if k == "build":
+            builds[dom] = t
+        elif k == "assertion":
+            s = t["subject"]
+            if "name" in s:
+                terms.setdefault((dom, _nk(s["name"]), s.get("type")), [s["name"], []])[1].append(t)
+            else:
+                rels.setdefault((dom, _nk(s["subject"]), s["predicate"], _nk(s["object"])),
+                                [(s["subject"], s["predicate"], s["object"]), []])[1].append(t)
+        elif k == "certification":
+            certs.append(t)
+        elif k == "conflict":
+            conflicts.append(t)
+
+    def in_force(nk):                    # one certification per name: the latest wins, as in the artifact
+        cs = [c for c in certs if _nk(c["subject"]["name"]) == nk]
+        return max(cs, key=lambda c: c.get("at") or "") if cs else None
+
+    def quote(a):
+        src = a.get("evidence") or {}
+        e = {k: v for k, v in src.items() if k != "doc"}
+        e.setdefault("quote", "")
+        return dict(e, source=src.get("doc", "?"), verdict=a.get("verdict") or "unjudged",
+                    **({"by": a["by"]} if a.get("by") else {}), **({"reason": a["reason"]} if a.get("reason") else {}))
+
+    def typed(vs, accepted):
+        if accepted:
+            return "accept"
+        if any(v == "grounded" for v in vs):
+            return "grounded"
+        return "ungrounded" if vs and all(v == "ungrounded" for v in vs) else "unjudged"
+
+    out, live, typed_names = [], set(), {k[1] for k in terms}
+    for (dom, nk, typ), (name, evs_) in sorted(terms.items()):
+        cert = in_force(nk)
+        if cert and cert["verdict"] == "reject" and cert["subject"]["type"] == typ:
+            continue                     # suppressed in every later fold, exactly as in the artifact
+        live.add(nk)
+        out.append({"id": f"ao:term:{_h(dom, nk, typ)}", "type": "Term", "name": name, "ontology_type": typ,
+                    "recorded_at": max((e.get("artifact", {}).get("built_at") or "" for e in evs_), default="") or "unknown",
+                    "domain": dom, "source": "dsh-auto-ontology",
+                    "verdict": typed([e.get("verdict") for e in evs_],
+                                     bool(cert and cert["verdict"] == "accept" and cert["subject"]["type"] == typ)),
+                    "evidence": [quote(e) for e in evs_]})
+    gone = typed_names - live           # a name with no typing left takes its relations with it
+    for (dom, sk, pred, ok), (names, evs_) in sorted(rels.items()):
+        if sk in gone or ok in gone:
+            continue
+        out.append({"id": f"ao:rel:{_h(dom, sk, pred, ok)}", "type": "Relation",
+                    "subject": names[0], "predicate": names[1], "object": names[2],
+                    "recorded_at": max((e.get("artifact", {}).get("built_at") or "" for e in evs_), default="") or "unknown",
+                    "domain": dom, "source": "dsh-auto-ontology",
+                    "verdict": typed([e.get("verdict") for e in evs_], None),
+                    "evidence": [quote(e) for e in evs_]})
+    for nk in sorted({_nk(c["subject"]["name"]) for c in certs}):
+        c = in_force(nk)
+        if c["verdict"] == "reject":
+            out.append({"id": f"ao:reject:{_h(c.get('domain') or '?', nk, c['subject']['type'], c.get('at') or '')}",
+                        "type": "Constraint", "recorded_at": c.get("at") or "unknown", "domain": c.get("domain") or "?",
+                        "source": "dsh-auto-ontology",
+                        "rule": f"{c['subject']['name']} is not a {c['subject']['type']} — rejected by {c.get('by')}"
+                                + (f": {c['note']}" if c.get("note") else ""),
+                        **({"evidence": [{"quote": c["evidence"]["quote"], "source": c["evidence"].get("doc", "?")}]}
+                           if (c.get("evidence") or {}).get("quote") else {})})
+    for c in conflicts:
+        types = c["subject"]["types"]
+        out.append({"id": f"ao:conflict:{_h(c.get('domain') or '?', _nk(c['subject']['name']))}", "type": "Constraint",
+                    "recorded_at": c.get("artifact", {}).get("built_at") or "unknown", "domain": c.get("domain") or "?",
+                    "source": "dsh-auto-ontology",
+                    "rule": f"{c['subject']['name']} is typed {' and '.join(types)} — both evidences kept, unresolved",
+                    "evidence": [dict(quote=v, source=v.get("doc", "?")) for v in types.values() if v.get("quote")]})
+    return out, builds
 
 
 # ── threshold trigger (issue #3, pure) ───────────────────────────────────────
@@ -227,11 +373,21 @@ def load_version(n):
 
 # ── evaluation gate (issue #5) — the first adapter is deterministic ─────────
 
+def _endorsement(rec):
+    """+1 endorsed · 0 unjudged · −1 judged against — the verdict a record carries.
+    A record from a source that judges nothing carries none and counts 0 (E1 layers
+    score exactly as before)."""
+    return {"accept": 1, "grounded": 1, "reject": -1, "ungrounded": -1}.get(rec.get("verdict"), 0)
+
+
 def evaluation_score(records):
     """Deterministic scoring: rerunnable by anyone, zero LLM.
-    Higher is better; ties keep the incumbent (conservative)."""
+    Higher is better; ties keep the incumbent (conservative). E2 adds a fourth
+    term: `endorsed`, the net-endorsed share of the layer — (endorsed − judged
+    against) / records — so a candidate wins by being better evidenced, not only
+    by being bigger or more varied."""
     if not records:
-        return {"total": 0.0, "coverage": 0.0, "cleanliness": 0.0, "diversity": 0.0, "count": 0}
+        return {"total": 0.0, "coverage": 0.0, "cleanliness": 0.0, "diversity": 0.0, "endorsed": 0.0, "count": 0}
     evidence_ids = {r["id"] for r in records if r.get("type") == "Evidence" and r.get("quote")}
     with_ev = sum(1 for r in records if r.get("type") != "Evidence" and
                   _has_evidence(r, evidence_ids))
@@ -241,9 +397,11 @@ def evaluation_score(records):
     cleanliness = 1.0 / (1.0 + len(violations))
     types_used = len({r.get("type") for r in records if r.get("type") in RECORD_TYPES})
     diversity = types_used / len(RECORD_TYPES)
-    return {"total": round(coverage + cleanliness + diversity, 4),
+    endorsed = sum(_endorsement(r) for r in records if r.get("type") != "Evidence") / non_ev
+    return {"total": round(coverage + cleanliness + diversity + endorsed, 4),
             "coverage": round(coverage, 4), "cleanliness": round(cleanliness, 4),
-            "diversity": round(diversity, 4), "violations": len(violations), "count": len(records)}
+            "diversity": round(diversity, 4), "endorsed": round(endorsed, 4),
+            "violations": len(violations), "count": len(records)}
 
 
 def gate_decides(candidate_score, incumbent_score):
@@ -293,9 +451,11 @@ def run_save(run):
     json.dump(run, open(run_path(run["run_id"]), "w", encoding="utf-8"), ensure_ascii=False, indent=1)
 
 
-def run_round(candidate_records, run=None):
+def run_round(candidate_records, run=None, incumbent=None, note=None):
     """One round: evaluate a candidate against the incumbent, publish iff it wins.
-    Budget is frozen at birth; exhaustion marks incomplete (extension is explicit)."""
+    Budget is frozen at birth; exhaustion marks incomplete (extension is explicit).
+    `incumbent` (an adapter's current projection) stands in for the incumbent when
+    no version was published yet; `note` is stored with the round."""
     run = run or run_load()
     if run["status"] != "running":
         sys.exit(tt(f"run {run['run_id']} is {run['status']} — cannot open rounds", f"运行 {run['run_id']} 已 {run['status']}——无法开轮"))
@@ -308,6 +468,7 @@ def run_round(candidate_records, run=None):
                     f"预算耗尽（{run['budget']['max_rounds']} 轮）；用 evolve extend 显式扩展或结束运行"))
     incumbent_n = run.get("accepted_version") or run["parent_version"]
     incumbent_records = (load_version(incumbent_n)["records"] if incumbent_n > 0
+                         else incumbent if incumbent is not None
                          else load_records(os.path.join(ws(), "records.jsonl"))
                          if os.path.exists(os.path.join(ws(), "records.jsonl")) else [])
     cand_score = evaluation_score(candidate_records)
@@ -316,7 +477,7 @@ def run_round(candidate_records, run=None):
     run["budget"]["rounds_used"] += 1
     round_rec = {"round": run["budget"]["rounds_used"],
                  "candidate_score": cand_score, "incumbent_score": inc_score,
-                 "won": won, "at": dt.datetime.now().isoformat(timespec="seconds")}
+                 "won": won, "at": dt.datetime.now().isoformat(timespec="seconds"), **({"note": note} if note else {})}
     if won:
         new_n = latest_version() + 1
         snapshot_version(new_n, candidate_records,
@@ -423,7 +584,20 @@ def main():
     tsub = tr.add_subparsers(dest="tcmd", required=True)
     tadd = tsub.add_parser("append")
     tadd.add_argument("--json", required=True, help="trajectory payload (agent+summary required; task_id/recorded_at auto)")
+    timp = tsub.add_parser("import")
+    timp.add_argument("--from", dest="frm", required=True, help="an ao-trajectory/0.1 export (dsh-auto-ontology)")
     tsub.add_parser("count")
+    ad = sub.add_parser("adapt")
+    asub = ad.add_subparsers(dest="acmd", required=True)
+    aao = asub.add_parser("auto-ontology")
+    aao.add_argument("--from", dest="frm", required=True, help="an ao-trajectory/0.1 export")
+    aao.add_argument("--auto-ontology", default=None,
+                     help="the sibling checkout or npm install whose eval judges proposals (env AUTO_ONTOLOGY_HOME)")
+    aao.add_argument("--proposer-model", default="deepseek-chat")
+    aao.add_argument("--judge-model", default="deepseek-chat")
+    aao.add_argument("--jobs", type=int, default=8)
+    aao.add_argument("--budget", type=int, default=1)
+    aao.add_argument("--dry-run", action="store_true", help="import + projection only: no model call, no run")
     args = ap.parse_args()
     LANG = args.lang
 
@@ -495,8 +669,18 @@ def main():
         if args.tcmd == "append":
             rec = trajectory_append(json.loads(args.json))
             print(f"+ {rec['task_id']} ({rec['agent']}) → {os.path.join(ws(), 'trajectories')}")
+        elif args.tcmd == "import":
+            added, skipped = trajectory_import(args.frm)
+            print(f"+ {added} trajectory record(s) from {args.frm} · {skipped} already present (idempotent by event id) · "
+                  f"{trajectory_count()} in the store")
         else:
             print(trajectory_count())
+
+    if args.cmd == "adapt":
+        import adapter_autoontology
+        adapter_autoontology.run(args.frm, auto_ontology=args.auto_ontology, dry_run=args.dry_run,
+                                 proposer_model=args.proposer_model, judge_model=args.judge_model,
+                                 jobs=args.jobs, budget=args.budget, K=sys.modules[__name__])
 
     if args.cmd == "record":
         path = os.path.join(ws(), "records.jsonl")

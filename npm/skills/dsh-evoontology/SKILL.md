@@ -21,9 +21,23 @@ evoontology validate .evo/records.jsonl       # format conformance
 evoontology record list
 ```
 
+From a dsh-auto-ontology export (needs the `auto-ontology` install for the judge:
+`--auto-ontology DIR`, `AUTO_ONTOLOGY_HOME`, or `auto-ontology` on PATH):
+
+```bash
+evoontology trajectory import --from trajectory.ndjson   # ao-trajectory/0.1, idempotent by event id
+evoontology adapt auto-ontology --from trajectory.ndjson --dry-run   # import + projection only, no model
+evoontology adapt auto-ontology --from trajectory.ndjson             # propose → judge → gate, one round
+```
+
+A won round writes `.evo/runs/<run>.proposals.json`; the trip back is an explicit,
+recorded act on the sibling side: `auto-ontology apply --proposals <file> --actor agent:<name>`.
+The round's output names the proposer and the judge — pass two different models.
+
 ## The covenant
 
 - Trajectories are append-only and evidence-linked;
 - Evolution is hypothesis-framed with a frozen budget; extension is explicit;
 - A candidate publishes only by winning an evaluation — deterministic, rerunnable;
-- No record without a verbatim source span.
+- No record without a verbatim source span;
+- A verdict rides on the record it was given for and is never rewritten.

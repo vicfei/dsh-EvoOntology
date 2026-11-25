@@ -23,3 +23,26 @@ agent 每次会话都在重学同样的东西。解法不是更大的上下文�
 **不做**：MCP 优先（typed-tools 是原生面）、追八种连接器、刷榜、与家族 dsh-WrenAI 抢问答位。
 
 详见 [ROADMAP](ROADMAP.md)（开发走 issue→branch→PR，CI 门从第一天装齐）。
+
+## E1 内核 + E2 首个适配器
+
+E1（零 LLM 内核）已发布：五记录证据库、轨迹库、阈值触发、冻结预算下的假设轮、评估门、SQLite 语义层种子。
+
+**E2 第一个适配器**——家族自己的 [dsh-auto-ontology](https://github.com/vicfei/dsh-auto-ontology) 接入：
+它的 `ao-trajectory/0.1` 导出变成轨迹，一轮假设轮为“没有引文支撑其类型”的词条提出改型，
+再由兄弟仓自己的 eval 判官裁决：
+
+```bash
+auto-ontology export ontologies/x.json > trajectory.ndjson     # 发生过什么
+evoontology trajectory import --from trajectory.ndjson         # 按事件 id 幂等
+evoontology adapt auto-ontology --from trajectory.ndjson       # 提议 → 判官 → 评估门
+auto-ontology apply --proposals .evo/runs/<run>.proposals.json --actor agent:<名字>   # 带回去
+```
+
+五步：导入（幂等）→ 投影（纯函数，每条记录带引文**及其判官结论**；被否决的认证变成 Constraint）→
+提议（模型读 TBox 与该词条全部引文，指出一个被某条引文明说的既有类型，否则返回 null；畸形提议在见判官前即丢弃）→
+裁决（走 auto-ontology **自己的 eval CLI**，判官逻辑零重写）→ 一轮（对投影、过评估门；赢了才发布，
+并写出 `runs/<run>.proposals.json` 供回写）。评估门新增第四项 `endorsed`（净背书占比）：层要赢得更被证据支撑。
+
+**赢了不代表什么**：改型词条按定义从 −1 变 +1，只要有一条过判官的提议这轮就赢——实验在判官，不在算术。
+尽量给提议者与判官指定两个不同模型（`--proposer-model` / `--judge-model`），运行记录两者。

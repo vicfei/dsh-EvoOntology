@@ -13,7 +13,7 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - name: engine syntax
-        run: python3 -m py_compile scripts/evoontology.py
+        run: python3 -m py_compile scripts/evoontology.py scripts/adapter_autoontology.py
       - name: record store semantics (pure, no network)
         run: |
           python3 - <<'EOF'
@@ -134,10 +134,144 @@ jobs:
           assert ext["status"] == "running" and ext["budget"]["max_rounds"] == 2
           print("session + gate: PASS")
           EOF
+      - name: auto-ontology adapter, without a model (pure, no network)
+        run: |
+          python3 - <<'EOF'
+          import importlib.util, json, os, sys, tempfile
+          os.environ["EVO_HOME"] = tempfile.mkdtemp()
+          sys.path.insert(0, "scripts")
+          spec = importlib.util.spec_from_file_location("ev", "scripts/evoontology.py")
+          M = importlib.util.module_from_spec(spec); spec.loader.exec_module(M)
+          M.WORKSPACE = os.environ["EVO_HOME"]
+          import adapter_autoontology as A
+          def ev(i, kind, **kw):
+              d = {"schema": "ao-trajectory/0.1", "id": f"aot_{i:016x}", "seq": i, "kind": kind, "at": None,
+                   "agent": "dsh-auto-ontology/m", "summary": f"{kind} {i}", "domain": "d",
+                   "artifact": {"built_at": "2026-11-25T17:18:55", "source": "a.json", "model": "m",
+                                "judge": "deepseek-chat"}, "endorsed": None}
+              d.update(kw); return d
+          stream = [
+              ev(0, "build", tbox={"entity_types": [{"name": "tool", "desc": "a thing"},
+                                                    {"name": "metric", "desc": "a number"}], "relation_types": []}),
+              ev(1, "assertion", subject={"name": "W", "type": "tool"}, evidence={"quote": "W is a tool.", "doc": "d"},
+                 verdict="grounded", by="judge", endorsed=True),
+              ev(2, "assertion", subject={"name": "X", "type": "tool"}, evidence={"quote": "X is mentioned.", "doc": "d"},
+                 verdict="ungrounded", by="judge", reason="mention only", endorsed=False),
+              ev(3, "assertion", subject={"name": "Y", "type": "tool"}, evidence={"quote": "Y reports a metric.", "doc": "d"},
+                 verdict="ungrounded", by="judge", reason="reports, not is", endorsed=False),
+              ev(4, "assertion", subject={"subject": "W", "predicate": "uses", "object": "Y"},
+                 evidence={"quote": "W uses Y.", "doc": "d"}, verdict="grounded", by="judge", endorsed=True),
+              ev(5, "assertion", subject={"subject": "W", "predicate": "uses", "object": "X"},
+                 evidence={"quote": "W uses X.", "doc": "d"}, verdict="grounded", by="judge", endorsed=True),
+              ev(6, "certification", at="2026-11-25T18:00:00", subject={"name": "X", "type": "tool"},
+                 verdict="reject", by="human:v", note="mention only", evidence={"quote": "X is mentioned.", "doc": "d"})]
+          path = os.path.join(os.environ["EVO_HOME"], "s.ndjson")
+          open(path, "w").write("\n".join(json.dumps(e) for e in stream) + "\n")
+          # import is idempotent by event id: a replay adds nothing, a foreign line stops it
+          assert M.trajectory_import(path) == (7, 0)
+          assert M.trajectory_import(path) == (0, 7)
+          assert M.trajectory_count() == 7
+          bad = path + ".bad"
+          open(bad, "w").write(json.dumps(stream[0]) + "\n" + '{"schema": "other/1", "id": "x"}\n')
+          try:
+              M.read_stream(bad); assert False
+          except SystemExit: pass
+          # the projection: one Term per (entity, type), verdicts kept on their quotes,
+          # a reject suppresses its typing and takes the rejected endpoint's relation with it
+          proj, builds = M.project_auto_ontology(M.trajectories())
+          assert [r["id"] for r in proj] == [r["id"] for r in M.project_auto_ontology(M.trajectories())[0]]
+          assert M.validate_records(proj) == []
+          terms = {r["name"]: r for r in proj if r["type"] == "Term"}
+          assert set(terms) == {"W", "Y"}
+          assert terms["W"]["verdict"] == "grounded" and terms["Y"]["verdict"] == "ungrounded"
+          assert terms["Y"]["evidence"][0]["reason"] == "reports, not is"
+          assert [(r["subject"], r["object"]) for r in proj if r["type"] == "Relation"] == [("W", "Y")]
+          rules = [r["rule"] for r in proj if r["type"] == "Constraint"]
+          assert len(rules) == 1 and "X is not a tool" in rules[0]
+          assert A.tbox_of(builds["d"]) == [{"name": "tool", "desc": "a thing"}, {"name": "metric", "desc": "a number"}]
+          # E1 layers score exactly as before: no verdict carried, no endorsed term
+          E = {"id": "ev1", "type": "Evidence", "recorded_at": "t", "quote": "q", "source": "s"}
+          T = {"id": "t1", "type": "Term", "recorded_at": "t", "name": "Rev", "evidence_ids": ["ev1"]}
+          s = M.evaluation_score([E, T])
+          assert s["endorsed"] == 0.0
+          assert s["total"] == round(s["coverage"] + s["cleanliness"] + s["diversity"], 4)
+          # the gate counts verdicts: a judge-grounded re-typing beats the projection on endorsed alone
+          inc = M.evaluation_score(proj)
+          assert inc["endorsed"] == 0.25 and inc["total"] == 2.85
+          y = terms["Y"]
+          new = dict(y, id="ao:term:new", ontology_type="metric", verdict="grounded",
+                     evidence=[{"quote": "Y reports a metric.", "source": "d", "verdict": "grounded"}])
+          cand = M.evaluation_score([new if r is y else r for r in proj])
+          assert cand["endorsed"] == 0.75 and cand["total"] > inc["total"]
+          for k in ("coverage", "cleanliness", "diversity"):
+              assert cand[k] == inc[k]
+          assert M.gate_decides(cand, inc) and not M.gate_decides(inc, inc)
+          # a round against the projection as the incumbent, with nothing published yet
+          run = M.run_start("re-type", budget=1)
+          run, rec = M.run_round([new if r is y else r for r in proj], run, incumbent=proj, note={"n": 1})
+          assert rec["won"] and rec["note"] == {"n": 1} and rec["incumbent_score"] == inc
+          assert run["status"] == "completed" and run["accepted_version"] == 1
+          assert M.load_version(1)["record_count"] == len(proj)
+          # without an explicit incumbent nothing published means an empty one (the E1 path, unchanged)
+          os.environ["EVO_HOME"] = tempfile.mkdtemp(); M.WORKSPACE = os.environ["EVO_HOME"]
+          run2, rec2 = M.run_round([E, T], M.run_start("first", budget=1))
+          assert rec2["won"] and rec2["incumbent_score"]["total"] == 0.0
+          # the adapter without a model: import + projection only, no run opened
+          os.environ["EVO_HOME"] = tempfile.mkdtemp(); M.WORKSPACE = os.environ["EVO_HOME"]
+          A.run(path, dry_run=True, K=M)
+          assert M.trajectory_count() == 7 and not os.path.isdir(os.path.join(M.WORKSPACE, "runs"))
+          # the proposer is verified before any judge sees it: type in the TBox, not the current
+          # typing, quote one of the term's own — else the proposal is dropped as malformed
+          class Fake:
+              def __init__(self, out): self.out = out
+              def complete(self, model, messages):
+                  assert "metric: a number" in messages[1]["content"] and "Y reports a metric." in messages[1]["content"]
+                  return self.out, {"prompt_tokens": 10, "completion_tokens": 5}
+          types, led = A.tbox_of(builds["d"]), {"calls": 0, "in": 0, "out": 0}
+          ok = {"type": "metric", "quote": "Y reports a metric.", "why": "states it"}
+          st, p_ok = A._propose(y, types, Fake(ok), "m", led)
+          assert st == "ok" and p_ok["to_type"] == "metric" and p_ok["doc"] == "d" and p_ok["term_id"] == y["id"]
+          for out in ({"type": "plugin", "quote": "Y reports a metric."},     # not a listed type
+                      {"type": "metric", "quote": "Y is a metric, invented."},  # not one of the term's quotes
+                      {"type": "tool", "quote": "Y is a tool."}):              # the current typing again
+              assert A._propose(y, types, Fake(out), "m", led)[0] == "malformed"
+          assert A._propose(y, types, Fake(None), "m", led) == ("none", None)  # an honest null
+          assert led == {"calls": 5, "in": 50, "out": 25}
+          # the judge is the sibling's own eval CLI: a fake checkout proves the wiring end to end
+          ao = os.path.join(os.environ["EVO_HOME"], "ao"); os.makedirs(ao)
+          open(os.path.join(ao, "eval_evidence.py"), "w").write(
+              "import json, sys\n"
+              "a = sys.argv\n"
+              "art = json.load(open(a[a.index('--from') + 1]))\n"
+              "assert a[a.index('--judge-model') + 1] == 'fake-judge' and a[a.index('--n') + 1] == '0'\n"
+              "assert art['abox']['entities'][0]['evidences'] == [{'quote': 'Y reports a metric.', 'doc': 'd'}]\n"
+              "with open(a[a.index('--out') + 1], 'w') as f:\n"
+              "    for e in art['abox']['entities']:\n"
+              "        q = chr(39)\n"
+              "        row = {'assertion': e['name'] + ' is of type ' + q + e['type'] + q,\n"
+              "               'supported': e['type'] == 'metric', 'reason': 'fake judge'}\n"
+              "        f.write(json.dumps(row) + '\\n')\n")
+          p_bad = dict(p_ok, name="Z", to_type="tool", quote="Z is a tool.")
+          judged = A.judge_proposals([p_ok, p_bad], types, ao, "fake-judge", 2, os.environ["EVO_HOME"])
+          assert [x["judged"] for x in judged] == [True, False] and judged[0]["judge_reason"] == "fake judge"
+          retyped = A.retype(y, judged[0], "fake-judge", K=M)
+          assert retyped["verdict"] == "grounded" and retyped["ontology_type"] == "metric"
+          assert retyped["evidence"][0] == {"quote": "Y reports a metric.", "source": "d", "verdict": "grounded",
+                                             "by": "judge:fake-judge", "reason": "fake judge"}
+          print("auto-ontology adapter: PASS")
+          EOF
       - name: bin entry syntax (node --check)
         run: node --check npm/bin/evoontology.js
-      - name: npm bundle packs clean
-        run: cd npm && npm pack --dry-run && rm -f *.tgz
+      - name: npm bundle packs the kernel and the adapter (dry run, no tarball written or deleted)
+        run: |
+          cd npm
+          npm pack --dry-run > /tmp/pack.txt 2>&1
+          for f in scripts/evoontology.py scripts/adapter_autoontology.py bin/evoontology.js; do
+            grep -q "$f" /tmp/pack.txt || { echo "MISSING FROM THE BUNDLE: $f"; cat /tmp/pack.txt; exit 1; }
+          done
+          if ls *.tgz >/dev/null 2>&1; then
+            echo "a tarball is sitting in npm/ — not deleted by CI; remove it by hand"; exit 1
+          fi
       - name: sqlite seed (pure, no network)
         run: |
           python3 - <<'EOF'
