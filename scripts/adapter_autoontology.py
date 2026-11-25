@@ -88,11 +88,18 @@ def _grounding(ao_dir):
 
 
 def tbox_of(build):
-    """Entity types of a build event: [{name, desc}] when the export carries the
-    definitions, names only when it predates them."""
+    """Entity types of a build event: [{name, desc}] — the definitions the export
+    carries (`tbox.entity_type_descs`, a sibling since its apply --proposals), a
+    desc on the type object for anything else shaped that way, names only for an
+    export that predates both."""
+    tbox = (build or {}).get("tbox", {})
+    descs = tbox.get("entity_type_descs") or {}
     out = []
-    for t in (build or {}).get("tbox", {}).get("entity_types", []):
-        out.append({"name": t["name"], "desc": t.get("desc", "")} if isinstance(t, dict) else {"name": t, "desc": ""})
+    for t in tbox.get("entity_types", []):
+        if isinstance(t, dict):
+            out.append({"name": t["name"], "desc": t.get("desc") or descs.get(t["name"], "")})
+        else:
+            out.append({"name": t, "desc": descs.get(t, "")})
     return out
 
 

@@ -219,11 +219,13 @@ def project_auto_ontology(trajs):
     triple, each carrying its quotes WITH their verdicts (a verdict is a fact
     about a quote, so evidence is never rewritten; a later judge simply adds a
     quote). The latest certification on a name is the one in force: its reject
-    suppresses that typing and becomes a Constraint record, its accept endorses
-    it. A relation stays while either endpoint still has a typing. A conflict is
-    kept as an open Constraint. Record ids derive from the claim and the domain,
-    so a replay projects to the same layer. Types outside the TBox and
-    ungrounded clashes assert nothing and project to no record."""
+    suppresses that typing — and every typing it lists in `also_rejects`, the
+    ones a re-typed name left behind — and becomes a Constraint record, its
+    accept endorses it. A relation stays while either endpoint still has a
+    typing. A conflict is kept as an open Constraint. Record ids derive from
+    the claim and the domain, so a replay projects to the same layer. Types
+    outside the TBox and ungrounded clashes assert nothing and project to no
+    record."""
     terms, rels, certs, conflicts, builds = {}, {}, [], [], {}
     for t in trajs:
         if t.get("schema") != AO_SCHEMA:
@@ -264,7 +266,7 @@ def project_auto_ontology(trajs):
     out, live, typed_names = [], set(), {k[1] for k in terms}
     for (dom, nk, typ), (name, evs_) in sorted(terms.items()):
         cert = in_force(nk)
-        if cert and cert["verdict"] == "reject" and cert["subject"]["type"] == typ:
+        if cert and cert["verdict"] == "reject" and (cert["subject"]["type"] == typ or typ in (cert.get("also_rejects") or [])):
             continue                     # suppressed in every later fold, exactly as in the artifact
         live.add(nk)
         out.append({"id": f"ao:term:{_h(dom, nk, typ)}", "type": "Term", "name": name, "ontology_type": typ,
@@ -286,11 +288,13 @@ def project_auto_ontology(trajs):
     for nk in sorted({_nk(c["subject"]["name"]) for c in certs}):
         c = in_force(nk)
         if c["verdict"] == "reject":
+            earlier = [f"nor a {t}" for t in (c.get("also_rejects") or [])]
             out.append({"id": f"ao:reject:{_h(c.get('domain') or '?', nk, c['subject']['type'], c.get('at') or '')}",
                         "type": "Constraint", "recorded_at": c.get("at") or "unknown", "domain": c.get("domain") or "?",
                         "source": "dsh-auto-ontology",
-                        "rule": f"{c['subject']['name']} is not a {c['subject']['type']} — rejected by {c.get('by')}"
-                                + (f": {c['note']}" if c.get("note") else ""),
+                        "rule": f"{c['subject']['name']} is not a {c['subject']['type']}"
+                                + (f", {' and '.join(earlier)}" if earlier else "")
+                                + f" — rejected by {c.get('by')}" + (f": {c['note']}" if c.get("note") else ""),
                         **({"evidence": [{"quote": c["evidence"]["quote"], "source": c["evidence"].get("doc", "?")}]}
                            if (c.get("evidence") or {}).get("quote") else {})})
     for c in conflicts:

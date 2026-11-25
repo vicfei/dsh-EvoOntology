@@ -151,8 +151,9 @@ jobs:
                                 "judge": "deepseek-chat"}, "endorsed": None}
               d.update(kw); return d
           stream = [
-              ev(0, "build", tbox={"entity_types": [{"name": "tool", "desc": "a thing"},
-                                                    {"name": "metric", "desc": "a number"}], "relation_types": []}),
+              ev(0, "build", tbox={"entity_types": ["tool", "metric"], "relation_types": [],
+                                   "entity_type_descs": {"tool": "a thing", "metric": "a number"},
+                                   "relation_type_descs": {}}),
               ev(1, "assertion", subject={"name": "W", "type": "tool"}, evidence={"quote": "W is a tool.", "doc": "d"},
                  verdict="grounded", by="judge", endorsed=True),
               ev(2, "assertion", subject={"name": "X", "type": "tool"}, evidence={"quote": "X is mentioned.", "doc": "d"},
@@ -189,6 +190,33 @@ jobs:
           rules = [r["rule"] for r in proj if r["type"] == "Constraint"]
           assert len(rules) == 1 and "X is not a tool" in rules[0]
           assert A.tbox_of(builds["d"]) == [{"name": "tool", "desc": "a thing"}, {"name": "metric", "desc": "a number"}]
+          assert A.tbox_of({"tbox": {"entity_types": [{"name": "tool", "desc": "a thing"}]}}) == [{"name": "tool", "desc": "a thing"}]
+          assert A.tbox_of({"tbox": {"entity_types": ["tool"]}}) == [{"name": "tool", "desc": ""}]   # an export that predates the definitions
+          # a name re-typed twice: the certification in force rejects its current typing AND lists
+          # the first one (`also_rejects`), so neither typing projects back
+          chain = [ev(0, "build", tbox={"entity_types": ["tool", "metric", "gauge"]}),
+                   ev(1, "assertion", subject={"name": "V", "type": "tool"}, evidence={"quote": "V is a tool.", "doc": "d"},
+                      verdict="grounded", by="judge", endorsed=True),
+                   ev(2, "assertion", subject={"name": "V", "type": "metric"}, evidence={"quote": "V is a metric.", "doc": "d"},
+                      verdict="grounded", by="judge:deepseek-reasoner", endorsed=True),
+                   ev(3, "assertion", subject={"name": "V", "type": "gauge"}, evidence={"quote": "V is a gauge.", "doc": "d"},
+                      verdict="grounded", by="judge:deepseek-reasoner", endorsed=True),
+                   ev(4, "certification", at="2026-11-25T18:00:00", subject={"name": "V", "type": "tool"}, verdict="reject",
+                      by="agent:evoontology-adapter", note="", evidence={"quote": "V is a tool.", "doc": "d"},
+                      retyped_to={"type": "metric", "quote": "V is a metric.", "doc": "d", "judge": "deepseek-reasoner"}),
+                   ev(5, "certification", at="2026-11-25T18:10:00", subject={"name": "V", "type": "metric"}, verdict="reject",
+                      by="agent:evoontology-adapter", note="", evidence={"quote": "V is a metric.", "doc": "d"},
+                      retyped_to={"type": "gauge", "quote": "V is a gauge.", "doc": "d", "judge": "deepseek-reasoner"},
+                      also_rejects=["tool"])]
+          proj2, _ = M.project_auto_ontology(chain)
+          assert [(r["type"], r.get("name") or r["rule"]) for r in proj2] == [
+              ("Term", "V"), ("Constraint", "V is not a metric, nor a tool — rejected by agent:evoontology-adapter")]
+          assert proj2[0]["ontology_type"] == "gauge" and len(proj2[0]["evidence"]) == 1
+          no_chain = [dict(e) for e in chain]
+          no_chain[5].pop("also_rejects")                                    # an export without the list: the first typing returns
+          back = M.project_auto_ontology(no_chain)[0]
+          assert sorted(r.get("ontology_type") for r in back if r["type"] == "Term") == ["gauge", "tool"]
+          assert back[-1]["rule"] == "V is not a metric — rejected by agent:evoontology-adapter"
           # E1 layers score exactly as before: no verdict carried, no endorsed term
           E = {"id": "ev1", "type": "Evidence", "recorded_at": "t", "quote": "q", "source": "s"}
           T = {"id": "t1", "type": "Term", "recorded_at": "t", "name": "Rev", "evidence_ids": ["ev1"]}
