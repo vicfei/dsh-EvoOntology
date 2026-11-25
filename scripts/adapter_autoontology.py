@@ -11,14 +11,24 @@ that quote, every certification. This adapter runs ONE hypothesis round on it:
             TBox and ALL the term's quotes and names ONE listed type that one quote
             states about the term — or nothing. A proposal whose type is not in the
             TBox, equals the current typing, or whose quote is not one of the term's
-            own (exact string match) is dropped here, before any judge sees it.
+            own is dropped here, before any judge sees it — with its reason, and on
+            disk. A quote that is one of the term's own as the sibling's verbatim rule
+            sees it (markdown marks and whitespace aside) is snapped to the term's own
+            string: what the judge sees and what comes back is never the model's copy.
   judge     every surviving proposal goes through dsh-auto-ontology's own eval CLI:
             the same prompt and one-quote protocol that flagged the term. Nothing
             about judging is re-implemented in this repo.
-  round     candidate = the projection with its grounded re-typings, against the
-            projection, under the kernel's gate. A won round publishes a layer and
-            writes runs/<run>.proposals.json for the trip back
-            (`auto-ontology apply --proposals`); a lost round publishes nothing.
+  round     candidate = the projection with its grounded re-typings, and for each
+            the constraint its certification will add — the layer the trip back
+            projects, no more — against the projection, under the kernel's gate.
+            A won round publishes a layer and writes runs/<run>.proposals.json for
+            the trip back (`auto-ontology apply --proposals`); a lost round
+            publishes nothing.
+            ONE stream, ONE run: an unchanged stream never opens a second run on its
+            own — after a lost round, another try is `evolve extend` (recorded on the
+            run); a changed stream is a new question and a new run. A crash closes its
+            run as `aborted` with the reason on it. Every round keeps its own judge
+            input and rows under runs/<run>.judge/round-N/.
 
 What the gate can and cannot say: a re-typed term moves from −1 to +1 on the
 endorsed share by construction, so a round with at least one judge-grounded
@@ -27,6 +37,7 @@ proposer and the judge are named on the run; when they are the same model the
 result carries that caveat with it.
 """
 import concurrent.futures as cf
+import datetime as dt
 import json
 import os
 import shutil
@@ -46,19 +57,23 @@ def _kernel(K):
 PROPOSER_SYSTEM = (
     "You audit typed terms of an ontology built from documents. You get: a term, the type "
     "a build gave it, the ontology's type definitions, and every quote collected for the "
-    "term. A strict judge found that none of the quotes states the given type about the term.\n"
+    "term, one JSON object per line. A strict judge found that none of the quotes states the "
+    "given type about the term.\n"
     "Find the ONE listed type that one of the quotes STATES about the term, and return that "
-    "quote copied character for character. Rules: the quote must be taken from the list, never "
-    "written anew; a quote that only mentions the term, or that is about a different thing, "
-    "counts for nothing; never return the term's current type. If no quote states any other "
-    "listed type about the term, return null.\n"
-    'Output JSON only: {"type": "<a listed type>", "quote": "<verbatim quote>", "why": "<one sentence>"} or null')
+    "line's quote value exactly as written. Rules: the value is copied from a line, never "
+    "written anew and never with its source added in front of it; a quote that only mentions "
+    "the term, or that is about a different thing, counts for nothing; never return the "
+    "term's current type.\n"
+    'Output JSON only: {"type": "<a listed type>", "quote": "<a quote value, exactly as '
+    'written>", "why": "<one sentence>"} when a quote states another listed type about the '
+    'term; otherwise {"type": null, "quote": null, "why": "<one sentence on why none does>"}')
 
 HYPOTHESIS = ("For terms whose typing no carried quote grounds, one of the TBox's own types is "
               "stated by a quote the build judged against the wrong type; re-typing them raises "
               "the layer's endorsed share and changes nothing else.")
 MAX_QUOTES = 40
 SHOW = 8
+APPLY_ACTOR = "agent:evoontology-adapter"   # what the trip back names — the candidate's constraint is written with it
 _LOCK = threading.Lock()   # the proposer calls run concurrently; one ledger, no races
 
 
@@ -105,13 +120,16 @@ def tbox_of(build):
 
 def _propose(term, types, g, model, ledger):
     """One model call for one ungrounded Term -> (status, proposal).
-    status: ok · none (the model returned null) · malformed (dropped, never judged)."""
+    status: ok — the quote is one of the term's own, byte for byte · snapped — the same
+    quote as the sibling's verbatim rule sees it (markdown marks and whitespace aside):
+    the term's own string goes on, never the model's · none — the model returned null ·
+    malformed — dropped with its reason, before any judge sees it."""
     defs = "".join(f"- {t['name']}: {t['desc']}\n" if t["desc"] else f"- {t['name']}\n" for t in types)
-    quotes = "".join(f"[{i}] ({x.get('source', '?')}) {x.get('quote', '')}\n"
+    quotes = "".join(f"[{i}] {json.dumps({'source': x.get('source', '?'), 'quote': x.get('quote', '')}, ensure_ascii=False)}\n"
                      for i, x in enumerate(term["evidence"][:MAX_QUOTES], 1))
     user = (f"Type definitions:\n{defs}\nTerm: {term['name']}\n"
             f"Current type (no quote states it): {term['ontology_type']}\n\n"
-            f"Quotes collected for the term:\n{quotes}")
+            f"Quotes collected for the term, one JSON object per line:\n{quotes}")
     out, usage = g.complete(model, [{"role": "system", "content": PROPOSER_SYSTEM},
                                     {"role": "user", "content": user}])
     with _LOCK:
@@ -121,14 +139,29 @@ def _propose(term, types, g, model, ledger):
     if not isinstance(out, dict) or out.get("type") is None:
         return "none", None
     typ, q = out.get("type"), out.get("quote")
-    if (typ not in {t["name"] for t in types} or typ == term["ontology_type"] or not isinstance(q, str)
-            or q not in {x.get("quote") for x in term["evidence"]}):
-        return "malformed", {"name": term["name"], "to_type": typ,
-                             "quote": q if isinstance(q, str) else str(q)[:80]}
+    own = [x.get("quote") for x in term["evidence"]]
+
+    def bad(why):
+        return "malformed", {"name": term["name"], "from_type": term["ontology_type"], "to_type": typ,
+                             "quote": q if isinstance(q, str) else str(q)[:80], "why": why}
+    if typ not in {t["name"] for t in types}:
+        return bad("a type outside the TBox")
+    if typ == term["ontology_type"]:
+        return bad("the term's current type")
+    status = "ok"
+    if q not in own:
+        vis = getattr(g, "is_verbatim", None)   # a sibling older than its verbatim rule: exact match only
+        both = [o for o in own if vis and isinstance(o, str) and isinstance(q, str) and vis(q, o) and vis(o, q)]
+        if not both:
+            part = [i for i, o in enumerate(own, 1) if vis and isinstance(o, str) and isinstance(q, str) and vis(q, o)]
+            more = [i for i, o in enumerate(own, 1) if vis and isinstance(o, str) and isinstance(q, str) and vis(o, q)]
+            return bad(f"part of own quote [{part[0]}], not the quote" if part else
+                       f"own quote [{more[0]}] with more added" if more else "not one of the term's quotes")
+        q, status = both[0], "snapped"
     doc = next(x.get("source", "?") for x in term["evidence"] if x.get("quote") == q)
-    return "ok", {"term_id": term["id"], "name": term["name"], "domain": term["domain"],
-                  "from_type": term["ontology_type"], "to_type": typ, "quote": q, "doc": doc,
-                  "why": str(out.get("why") or "")[:200]}
+    return status, {"term_id": term["id"], "name": term["name"], "domain": term["domain"],
+                    "from_type": term["ontology_type"], "to_type": typ, "quote": q, "doc": doc,
+                    "why": str(out.get("why") or "")[:200], **({"snapped": True} if status == "snapped" else {})}
 
 
 def judge_proposals(props, types, ao_dir, model, jobs, workdir):
@@ -175,10 +208,11 @@ def retype(term, p, judge_model, K=None):
                 ontology_type=p["to_type"], verdict="grounded", evidence=ev)
 
 
-def _show(title, props):
+def _show(title, props, why="proposed"):
     for p in props[:SHOW]:
         print(f"           {title} {p['name']}: {p['from_type']} → {p['to_type']} — \"{p['quote'][:70]}\""
-              + (f" ({p['judge_reason'][:60]})" if p.get("judge_reason") else ""))
+              + (f" ({p['judge_reason'][:60]})" if p.get("judge_reason") else "")
+              + (f" — {why}: {p['why']}" if p.get("why") else ""))
     if len(props) > SHOW:
         print(f"           … and {len(props) - SHOW} more")
 
@@ -217,20 +251,33 @@ def run(path, auto_ontology=None, dry_run=False, proposer_model="deepseek-chat",
             types.setdefault(t["name"], t["desc"])
     types = [{"name": n, "desc": d} for n, d in types.items()]
 
-    run_ = K.run_start(HYPOTHESIS, budget)
-    workdir = os.path.join(K.runs_dir(), run_["run_id"] + ".judge")
-    print(f"run      {run_['run_id']} opened · proposer {proposer_model} · judge {judge} (auto-ontology eval) · "
+    run_ = K.run_for_stream(K.stream_fingerprint(path), HYPOTHESIS, budget)
+    try:
+        return _round(K, run_, terms, proj, builds, types, proposer_model, judge, jobs, ao_dir, g)
+    except BaseException as exc:          # the run is closed with the reason on it, then the error goes on
+        K.run_abort(run_, f"{type(exc).__name__}: {exc}"[:200])
+        raise
+
+
+def _round(K, run_, terms, proj, builds, types, proposer_model, judge, jobs, ao_dir, g):
+    workdir = os.path.join(K.runs_dir(), run_["run_id"] + ".judge", f"round-{run_['budget']['rounds_used'] + 1}")
+    print(f"run      {run_['run_id']} · {run_['budget']['rounds_used']}/{run_['budget']['max_rounds']} round(s) used "
+          f"before this one · proposer {proposer_model} · judge {judge} (auto-ontology eval) · "
           f"{len(terms)} ungrounded Term(s) to propose for")
     ledger = {"calls": 0, "in": 0, "out": 0}
-    props, tally = [], {"ok": 0, "none": 0, "malformed": 0}
+    props, tally = [], {"ok": 0, "snapped": 0, "none": 0, "malformed": 0}
     malformed = []
     with cf.ThreadPoolExecutor(max_workers=max(1, jobs)) as ex:
         for status, p in ex.map(lambda t: _propose(t, tbox_of(builds.get(t["domain"])), g, proposer_model, ledger), terms):
             tally[status] += 1
-            (props if status == "ok" else malformed if p else []).append(p)
-    print(f"propose  {tally['ok']} proposal(s) · {tally['none']} null · {tally['malformed']} malformed (dropped) · "
+            (props if status in ("ok", "snapped") else malformed if p else []).append(p)
+    print(f"propose  {tally['ok']} proposal(s) · {tally['snapped']} snapped to the term's own quote · "
+          f"{tally['none']} null · {tally['malformed']} malformed (dropped) · "
           f"{ledger['calls']} call(s) · {ledger['in']:,} in / {ledger['out']:,} out tokens")
-    _show("malformed:", malformed)
+    _show("malformed:", malformed, why="dropped")
+    os.makedirs(workdir, exist_ok=True)  # everything the proposer said is on disk before a judge runs
+    json.dump({"terms": len(terms), "tally": tally, "proposals": props, "malformed": malformed},
+              open(os.path.join(workdir, "proposed.json"), "w", encoding="utf-8"), ensure_ascii=False, indent=1)
     props = judge_proposals(props, types, ao_dir, judge, jobs, workdir) if props else []
     grounded = [p for p in props if p["judged"] is True]
     refused = [p for p in props if p["judged"] is False]
@@ -241,7 +288,14 @@ def run(path, auto_ontology=None, dry_run=False, proposer_model="deepseek-chat",
 
     by_id = {r["id"]: r for r in proj}
     swap = {p["term_id"]: retype(by_id[p["term_id"]], p, judge) for p in grounded}
+    # the candidate is the layer the trip back will project: `apply --proposals` records each
+    # re-typing as a reject certification on the old typing, and that is one more record
     cand = [swap.get(r["id"], r) for r in proj]
+    cand += [K.reject_constraint(by_id[p["term_id"]]["name"], p["from_type"], by_id[p["term_id"]]["domain"],
+                                 APPLY_ACTOR, f"re-typed as {p['to_type']}: judge {judge} grounded another quote",
+                                 dt.datetime.now().isoformat(timespec="seconds"),
+                                 by_id[p["term_id"]]["evidence"][0].get("quote"),
+                                 by_id[p["term_id"]]["evidence"][0].get("source", "?")) for p in grounded]
     note = {"adapter": "dsh-auto-ontology", "terms_proposed_for": len(terms), "proposals": tally,
             "grounded": len(grounded), "refused": len(refused), "judge_errors": len(errors),
             "proposer": proposer_model, "judge": judge}
@@ -251,12 +305,12 @@ def run(path, auto_ontology=None, dry_run=False, proposer_model="deepseek-chat",
     if rec["won"]:
         out = os.path.join(K.runs_dir(), run_["run_id"] + ".proposals.json")
         json.dump({"run_id": run_["run_id"], "at": rec["at"], "hypothesis": run_["hypothesis"],
-                   "proposer_model": proposer_model, "judge_model": judge,
+                   "proposer_model": proposer_model, "judge_model": judge, "apply_actor": APPLY_ACTOR,
                    "proposals": [dict(p, grounded=p["judged"] is True) for p in props]},
                   open(out, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
         print(f"▲ WON    → published layer_v{rec['published_version']} · the judge's input and rows: {workdir}")
         print(f"           proposals -> {out}")
-        print(f"           trip back: auto-ontology apply --proposals {out} --from <artifact.json> --actor agent:<name>")
+        print(f"           trip back: auto-ontology apply --proposals {out} --from <artifact.json> --actor {APPLY_ACTOR}")
     else:
         why = "no proposal survived the judge" if not grounded else "the gate kept the incumbent"
         print(f"· LOST   — {why}: nothing published (run {run_['run_id']} is {run_['status']}, "

@@ -220,7 +220,8 @@ def project_auto_ontology(trajs):
     about a quote, so evidence is never rewritten; a later judge simply adds a
     quote). The latest certification on a name is the one in force: its reject
     suppresses that typing — and every typing it lists in `also_rejects`, the
-    ones a re-typed name left behind — and becomes a Constraint record, its
+    ones a re-typed name left behind — and becomes a Constraint record
+    (`reject_constraint`), its
     accept endorses it. A relation stays while either endpoint still has a
     typing. A conflict is kept as an open Constraint. Record ids derive from
     the claim and the domain, so a replay projects to the same layer. Types
@@ -288,23 +289,34 @@ def project_auto_ontology(trajs):
     for nk in sorted({_nk(c["subject"]["name"]) for c in certs}):
         c = in_force(nk)
         if c["verdict"] == "reject":
-            earlier = [f"nor a {t}" for t in (c.get("also_rejects") or [])]
-            out.append({"id": f"ao:reject:{_h(c.get('domain') or '?', nk, c['subject']['type'], c.get('at') or '')}",
-                        "type": "Constraint", "recorded_at": c.get("at") or "unknown", "domain": c.get("domain") or "?",
-                        "source": "dsh-auto-ontology",
-                        "rule": f"{c['subject']['name']} is not a {c['subject']['type']}"
-                                + (f", {' and '.join(earlier)}" if earlier else "")
-                                + f" — rejected by {c.get('by')}" + (f": {c['note']}" if c.get("note") else ""),
-                        **({"evidence": [{"quote": c["evidence"]["quote"], "source": c["evidence"].get("doc", "?")}]}
-                           if (c.get("evidence") or {}).get("quote") else {})})
+            ev = c.get("evidence") or {}
+            out.append(reject_constraint(c["subject"]["name"], c["subject"]["type"], c.get("domain") or "?",
+                                         c.get("by"), c.get("note"), c.get("at"),
+                                         ev.get("quote"), ev.get("doc", "?"), c.get("also_rejects")))
     for c in conflicts:
         types = c["subject"]["types"]
         out.append({"id": f"ao:conflict:{_h(c.get('domain') or '?', _nk(c['subject']['name']))}", "type": "Constraint",
                     "recorded_at": c.get("artifact", {}).get("built_at") or "unknown", "domain": c.get("domain") or "?",
                     "source": "dsh-auto-ontology",
                     "rule": f"{c['subject']['name']} is typed {' and '.join(types)} — both evidences kept, unresolved",
-                    "evidence": [dict(quote=v, source=v.get("doc", "?")) for v in types.values() if v.get("quote")]})
+                        "evidence": [dict(quote=v, source=v.get("doc", "?")) for v in types.values() if v.get("quote")]})
     return out, builds
+
+
+def reject_constraint(name, typ, domain, by, note, at, quote=None, source=None, also_rejects=None):
+    """The record a reject certification projects to: the name is not that type —
+    and not the typings a later re-typing left behind (`also_rejects`) — said by
+    `by`, with the note. An adapter's candidate builds the same record for each
+    re-typing it proposes, so the layer a won round publishes is the layer the
+    trip back projects. The id derives from the claim alone: a name has one
+    certification in force, so the typing tells the records apart."""
+    earlier = [f"nor a {t}" for t in (also_rejects or [])]
+    return {"id": f"ao:reject:{_h(domain, _nk(name), typ)}",
+            "type": "Constraint", "recorded_at": at or "unknown", "domain": domain,
+            "source": "dsh-auto-ontology",
+            "rule": f"{name} is not a {typ}" + (f", {' and '.join(earlier)}" if earlier else "")
+                    + f" — rejected by {by}" + (f": {note}" if note else ""),
+            **({"evidence": [{"quote": quote, "source": source}]} if quote else {})}
 
 
 # ── threshold trigger (issue #3, pure) ───────────────────────────────────────
@@ -425,18 +437,54 @@ def run_path(run_id):
     return os.path.join(runs_dir(), f"{run_id}.json")
 
 
-def run_start(hypothesis, budget=3):
-    """Open an evolution run: hypothesis required, budget frozen from birth."""
+def stream_fingerprint(path):
+    """What makes a stream "the same stream": its event ids, in order. -> {source, events, sha}"""
+    evs = read_stream(path)
+    return {"source": os.path.basename(path), "events": len(evs),
+            "sha": hashlib.sha1("\n".join(e["id"] for e in evs).encode()).hexdigest()[:12]}
+
+
+def run_start(hypothesis, budget=3, stream=None):
+    """Open an evolution run: hypothesis required, budget frozen from birth. `stream` is the
+    fingerprint of the ao-trajectory export an adapter runs on, when it has one."""
     if not hypothesis.strip():
         sys.exit(tt("a run needs a hypothesis — what are you trying to improve?", "一次运行需要假设——你想改进什么？"))
     run_id = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    while os.path.exists(run_path(run_id)):   # a second run in the same second never overwrites the first
+        run_id += "b"
     parent = latest_version()
     run = {"run_id": run_id, "hypothesis": hypothesis, "parent_version": parent,
            "budget": {"max_rounds": budget, "rounds_used": 0},
            "status": "running", "rounds": [], "accepted_version": None,
-           "started_at": dt.datetime.now().isoformat(timespec="seconds")}
+           "started_at": dt.datetime.now().isoformat(timespec="seconds"),
+           **({"stream": stream} if stream else {})}
     json.dump(run, open(run_path(run_id), "w", encoding="utf-8"), ensure_ascii=False, indent=1)
     return run
+
+
+def run_for_stream(stream, hypothesis, budget=1):
+    """The run a stream's next round belongs to. ONE stream, ONE run: an unchanged stream
+    never opens a second run on its own — a round it lost spent its budget, and another
+    try is `evolve extend` (the explicit human act), recorded on the run; a changed
+    stream is a new question and opens a new run. A run that crashed (`aborted`) never
+    finished, so it holds nothing back. -> a run with a round left"""
+    prev = None
+    for f in sorted((x for x in os.listdir(runs_dir()) if x.endswith(".json") and not x.endswith(".proposals.json")),
+                    reverse=True):
+        r = json.load(open(os.path.join(runs_dir(), f), encoding="utf-8"))
+        if (r.get("stream") or {}).get("sha") == stream["sha"] and r["status"] != "aborted":
+            prev = r
+            break
+    if prev is None:
+        return run_start(hypothesis, budget, stream)
+    used, cap = prev["budget"]["rounds_used"], prev["budget"]["max_rounds"]
+    if prev["status"] == "completed" or used >= cap:
+        sys.exit(tt(f"{stream['source']} is the stream run {prev['run_id']} already ran on ({prev['status']}, "
+                    f"{used}/{cap} round(s) used) — an unchanged stream gets no second run on its own: "
+                    f"evolve extend {prev['run_id']} to try another round, or bring a changed stream",
+                    f"{stream['source']} 是运行 {prev['run_id']} 跑过的那条流（{prev['status']}，已用 {used}/{cap} 轮）——"
+                    f"未变化的流不会自行再开一次运行：先 evolve extend {prev['run_id']} 再试一轮，或换一条有变化的流"))
+    return prev
 
 
 def run_load(run_id=None):
@@ -494,10 +542,22 @@ def run_round(candidate_records, run=None, incumbent=None, note=None):
     return run, round_rec
 
 
-def run_extend(run_id=None, extra=2):
-    """Explicit budget extension — the human act."""
+def run_abort(run, reason):
+    """Close a run its adapter could not finish — a crash must not leave it `running`
+    for ever. `aborted` is terminal: no round opens on it, nothing extends it."""
+    if run["status"] == "running":
+        run["status"], run["incomplete_reason"] = "aborted", reason
+        run_save(run)
+    return run
+
+
+def run_extend(run_id=None, extra=2, note=None):
+    """Explicit budget extension — the human act, and recorded as one: every extension
+    carries its time and, when given, the reason."""
     run = run_load(run_id)
     run["budget"]["max_rounds"] += extra
+    run.setdefault("extensions", []).append(
+        {"at": dt.datetime.now().isoformat(timespec="seconds"), "extra": extra, **({"note": note} if note else {})})
     if run["status"] == "incomplete":
         run["status"] = "running"
         run.pop("incomplete_reason", None)
@@ -579,6 +639,7 @@ def main():
     estatus.add_argument("--run", default=None)
     eextend = esub.add_parser("extend")
     eextend.add_argument("--extra", type=int, default=2)
+    eextend.add_argument("--note", default=None, help="why the budget grows — recorded on the run")
     eextend.add_argument("--run", default=None)
     tg = sub.add_parser("trigger")
     tg.add_argument("--trajectories", type=int, default=10, help="N new trajectories to trigger (default 10)")
@@ -656,7 +717,7 @@ def main():
                 mark = "▲" if r["won"] else "·"
                 print(f"  {mark} round {r['round']}: cand {r['candidate_score']['total']} vs inc {r['incumbent_score']['total']}")
         elif args.ecmd == "extend":
-            run = run_extend(args.run, args.extra)
+            run = run_extend(args.run, args.extra, note=args.note)
             print(f"extended to {run['budget']['max_rounds']} rounds · status: {run['status']}")
 
     if args.cmd == "trigger":

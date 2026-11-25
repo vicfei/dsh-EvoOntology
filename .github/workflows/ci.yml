@@ -137,7 +137,7 @@ jobs:
       - name: auto-ontology adapter, without a model (pure, no network)
         run: |
           python3 - <<'EOF'
-          import importlib.util, json, os, sys, tempfile
+          import importlib.util, json, os, shutil, sys, tempfile
           os.environ["EVO_HOME"] = tempfile.mkdtemp()
           sys.path.insert(0, "scripts")
           spec = importlib.util.spec_from_file_location("ev", "scripts/evoontology.py")
@@ -249,22 +249,37 @@ jobs:
           A.run(path, dry_run=True, K=M)
           assert M.trajectory_count() == 7 and not os.path.isdir(os.path.join(M.WORKSPACE, "runs"))
           # the proposer is verified before any judge sees it: type in the TBox, not the current
-          # typing, quote one of the term's own — else the proposal is dropped as malformed
+          # typing, quote one of the term's own — else the proposal is dropped as malformed, with its reason
           class Fake:
               def __init__(self, out): self.out = out
               def complete(self, model, messages):
                   assert "metric: a number" in messages[1]["content"] and "Y reports a metric." in messages[1]["content"]
                   return self.out, {"prompt_tokens": 10, "completion_tokens": 5}
+              def is_verbatim(self, q, t):        # the sibling's rule, in miniature: whitespace collapsed
+                  return " ".join(q.split()) in " ".join(t.split())
           types, led = A.tbox_of(builds["d"]), {"calls": 0, "in": 0, "out": 0}
           ok = {"type": "metric", "quote": "Y reports a metric.", "why": "states it"}
           st, p_ok = A._propose(y, types, Fake(ok), "m", led)
           assert st == "ok" and p_ok["to_type"] == "metric" and p_ok["doc"] == "d" and p_ok["term_id"] == y["id"]
-          for out in ({"type": "plugin", "quote": "Y reports a metric."},     # not a listed type
-                      {"type": "metric", "quote": "Y is a metric, invented."},  # not one of the term's quotes
-                      {"type": "tool", "quote": "Y is a tool."}):              # the current typing again
-              assert A._propose(y, types, Fake(out), "m", led)[0] == "malformed"
+          assert "snapped" not in p_ok
+          for out, why in (({"type": "plugin", "quote": "Y reports a metric."}, "a type outside the TBox"),   # not a listed type
+                           ({"type": "metric", "quote": "Y is a metric, invented."}, "not one of the term's quotes"),
+                           ({"type": "tool", "quote": "Y is a tool."}, "the term's current type"),           # the current typing again
+                           ({"type": "metric", "quote": "Y reports a"}, "part of own quote [1], not the quote"),
+                           ({"type": "metric", "quote": "Y reports a metric. Plus this."}, "own quote [1] with more added"),
+                           ({"type": "metric", "quote": None}, "not one of the term's quotes")):
+              st, bad_p = A._propose(y, types, Fake(out), "m", led)
+              assert st == "malformed" and bad_p["why"] == why and bad_p["from_type"] == "tool", (st, bad_p)
+          A._show("malformed:", [bad_p])   # a malformed record prints its reason; nothing else is asked of it
+          # the same quote as the sibling's verbatim rule sees it: snapped to the term's OWN string
+          st, p_snap = A._propose(y, types, Fake({"type": "metric", "quote": "Y   reports a metric. "}), "m", led)
+          assert st == "snapped" and p_snap["snapped"] is True and p_snap["quote"] == "Y reports a metric."
           assert A._propose(y, types, Fake(None), "m", led) == ("none", None)  # an honest null
-          assert led == {"calls": 5, "in": 50, "out": 25}
+          class OldSibling(Fake):              # a sibling that predates its verbatim rule: exact match only
+              is_verbatim = None
+          assert A._propose(y, types, OldSibling({"type": "metric", "quote": "Y  reports a metric."}), "m", led)[1]["why"] == \
+              "not one of the term's quotes"
+          assert led == {"calls": 10, "in": 100, "out": 50}
           # the judge is the sibling's own eval CLI: a fake checkout proves the wiring end to end
           ao = os.path.join(os.environ["EVO_HOME"], "ao"); os.makedirs(ao)
           open(os.path.join(ao, "eval_evidence.py"), "w").write(
@@ -286,6 +301,135 @@ jobs:
           assert retyped["verdict"] == "grounded" and retyped["ontology_type"] == "metric"
           assert retyped["evidence"][0] == {"quote": "Y reports a metric.", "source": "d", "verdict": "grounded",
                                              "by": "judge:fake-judge", "reason": "fake judge"}
+          # the whole run offline: a fake sibling whose proposer answers (with stray whitespace) and whose
+          # eval judges — the run completes, the layer publishes, all of it is on disk
+          open(os.path.join(ao, "grounding.py"), "w").write(
+              "def complete(model, messages):\n"
+              "    return {'type': 'metric', 'quote': 'Y  reports a metric.', 'why': 'states it'}, "
+              "{'prompt_tokens': 10, 'completion_tokens': 5}\n"
+              "def is_verbatim(q, t):\n"
+              "    return ' '.join(q.split()) in ' '.join(t.split())\n")
+          A.run(path, auto_ontology=ao, proposer_model="m", judge_model="fake-judge", jobs=2, K=M)
+          rid = [f.split(".")[0] for f in os.listdir(M.runs_dir()) if f.endswith(".json") and ".proposals." not in f]
+          assert len(rid) == 1
+          run = M.run_load(rid[0])
+          assert run["status"] == "completed" and run["accepted_version"] == 1
+          assert run["budget"] == {"max_rounds": 1, "rounds_used": 1}
+          assert run["rounds"][0]["note"]["proposals"] == {"ok": 0, "snapped": 1, "none": 0, "malformed": 0}
+          assert run["rounds"][0]["candidate_score"]["endorsed"] > run["rounds"][0]["incumbent_score"]["endorsed"]
+          back = json.load(open(os.path.join(M.runs_dir(), rid[0] + ".proposals.json")))
+          assert back["judge_model"] == "fake-judge" and back["proposer_model"] == "m" and len(back["proposals"]) == 1
+          assert back["proposals"][0]["grounded"] is True and back["proposals"][0]["snapped"] is True
+          assert back["proposals"][0]["quote"] == "Y reports a metric."        # the term's own string, not the model's copy
+          assert back["apply_actor"] == "agent:evoontology-adapter"
+          on_disk = json.load(open(os.path.join(M.runs_dir(), rid[0] + ".judge", "round-1", "proposed.json")))
+          assert on_disk["terms"] == 1 and on_disk["tally"]["snapped"] == 1 and on_disk["malformed"] == []
+          assert not os.path.exists(os.path.join(M.runs_dir(), rid[0] + ".judge", "proposed.json"))
+          assert [r["ontology_type"] for r in M.load_version(1)["records"] if r["type"] == "Term" and r["name"] == "Y"] == ["metric"]
+          # the candidate is scored with the constraint its certification adds: 3 of 5 records endorsed, not 3 of 4
+          assert run["rounds"][0]["candidate_score"]["endorsed"] == 0.6 and run["rounds"][0]["candidate_score"]["count"] == 5
+          # what the round published is what the trip back projects: the two events `apply --proposals`
+          # and a re-export add (the old typing rejected, the new asserted with its judge named)
+          trip = [ev(70, "assertion", subject={"name": "Y", "type": "metric"},
+                     evidence={"quote": "Y reports a metric.", "doc": "d"}, verdict="grounded",
+                     by="judge:fake-judge", reason="fake judge", endorsed=True),
+                  ev(71, "certification", at="2026-11-25T19:00:00", subject={"name": "Y", "type": "tool"}, verdict="reject",
+                     by="agent:evoontology-adapter", note="re-typed as metric: judge fake-judge grounded another quote",
+                     evidence={"quote": "Y reports a metric.", "doc": "d", "grounded": False, "reason": "reports, not is"},
+                     retyped_to={"type": "metric", "quote": "Y reports a metric.", "doc": "d", "judge": "fake-judge"})]
+          back_stream = path + ".back"
+          open(back_stream, "w").write(open(path).read() + "\n".join(json.dumps(e) for e in trip) + "\n")
+          A.run(back_stream, dry_run=True, K=M)
+          after, _ = M.project_auto_ontology(M.trajectories())
+          published = M.load_version(1)["records"]
+          same = lambda r: (r["id"], r["type"], r.get("verdict"), r.get("ontology_type"), r.get("rule"), r.get("domain"),
+                            json.dumps(r.get("evidence"), sort_keys=True), r.get("subject"), r.get("predicate"), r.get("object"))
+          assert sorted(map(same, after)) == sorted(map(same, published))       # the apply time is the one thing left out
+          assert M.evaluation_score(after) == run["rounds"][0]["candidate_score"]
+          assert [r["id"] for r in after if r["type"] == "Constraint" and r["rule"].startswith("Y is not")] == [
+              f"ao:reject:{M._h('d', M._nk('Y'), 'tool')}"]
+          # the quotes reach the model as JSON lines: the value it copies is bounded by the encoding,
+          # never by a source label sitting in front of it
+          class Spy(Fake):
+              seen = None
+              def complete(self, model, messages):
+                  Spy.seen = messages[1]["content"]; return self.out, {"prompt_tokens": 1, "completion_tokens": 1}
+          A._propose(y, types, Spy(ok), "m", {"calls": 0, "in": 0, "out": 0})
+          lines = [l for l in Spy.seen.splitlines() if l.startswith("[")]
+          assert [json.loads(l.split(" ", 1)[1]) for l in lines] == [
+              {"source": "d", "quote": "Y reports a metric."}] and "(d) Y reports" not in Spy.seen
+          # one stream, one run: an unchanged stream never opens a second run on its own — the run
+          # that won is completed, the run that lost needs an explicit, recorded extension
+          for call, want in ((lambda: A.run(path, auto_ontology=ao, proposer_model="m", judge_model="fake-judge", K=M),
+                              "already ran on (completed"),):
+              try:
+                  call(); assert False
+              except SystemExit as why:
+                  assert want in str(why) and f"evolve extend {rid[0]}" in str(why), why
+          os.environ["EVO_HOME"] = tempfile.mkdtemp(); M.WORKSPACE = os.environ["EVO_HOME"]
+          ao3 = os.path.join(os.environ["EVO_HOME"], "ao3"); os.makedirs(ao3)
+          open(os.path.join(ao3, "eval_evidence.py"), "w").write(
+              "import json, sys\n"
+              "a = sys.argv\n"
+              "art = json.load(open(a[a.index('--from') + 1]))\n"
+              "with open(a[a.index('--out') + 1], 'w') as f:\n"
+              "    for e in art['abox']['entities']:\n"
+              "        q = chr(39)\n"
+              "        f.write(json.dumps({'assertion': e['name'] + ' is of type ' + q + e['type'] + q,\n"
+              "                            'supported': False, 'reason': 'refused'}) + '\\n')\n")
+          shutil.copy(os.path.join(ao, "grounding.py"), ao3)
+          files = lambda: sorted(f for f in os.listdir(M.runs_dir()) if f.endswith(".json"))
+          A.run(path, auto_ontology=ao3, proposer_model="m", judge_model="fake-judge", K=M)   # the judge refuses: lost
+          lost_id = files()[0][:-5]
+          assert len(files()) == 1 and not os.path.exists(os.path.join(M.runs_dir(), lost_id + ".proposals.json"))
+          try:
+              A.run(path, auto_ontology=ao3, proposer_model="m", judge_model="fake-judge", K=M); assert False
+          except SystemExit as why:
+              assert "already ran on (running, 1/1" in str(why) and f"evolve extend {lost_id}" in str(why), why
+          M.run_extend(lost_id, extra=1, note="the proposer's prompt was fixed")
+          A.run(path, auto_ontology=ao3, proposer_model="m", judge_model="fake-judge", K=M)   # round 2 of the same run
+          again = json.load(open(os.path.join(M.runs_dir(), lost_id + ".json")))
+          assert len(again["rounds"]) == 2 and again["budget"] == {"max_rounds": 2, "rounds_used": 2}
+          assert len(again["extensions"]) == 1 and again["extensions"][0]["extra"] == 1
+          assert again["extensions"][0]["note"] == "the proposer's prompt was fixed" and again["stream"]["events"] == 7
+          assert files() == [lost_id + ".json"]
+          # every round keeps its own judge input and rows: a lost round's survive the round after it
+          kept = [[json.loads(l) for l in open(os.path.join(M.runs_dir(), lost_id + ".judge", f"round-{n}", "rows.jsonl")) if l.strip()]
+                  for n in (1, 2)]
+          assert all(len(rows) == 1 and rows[0]["reason"] == "refused" for rows in kept)
+          # a changed stream is a new question: one new event opens a new run
+          open(path, "a").write(json.dumps(ev(7, "assertion", subject={"name": "Q", "type": "tool"},
+                                             evidence={"quote": "Q is a tool.", "doc": "d"}, verdict="grounded",
+                                             by="judge", endorsed=True)) + "\n")
+          A.run(path, auto_ontology=ao3, proposer_model="m", judge_model="fake-judge", K=M)
+          assert len(files()) == 2
+          # a proposer that crashes closes the run as aborted — never left `running` — and aborted is terminal
+          os.environ["EVO_HOME"] = tempfile.mkdtemp(); M.WORKSPACE = os.environ["EVO_HOME"]
+          M.trajectory_import(path)
+          ao2 = os.path.join(os.environ["EVO_HOME"], "ao2"); os.makedirs(ao2)
+          shutil.copy(os.path.join(ao, "eval_evidence.py"), ao2)
+          open(os.path.join(ao2, "grounding.py"), "w").write("def complete(model, messages):\n    raise RuntimeError('boom')\n")
+          sys.modules.pop("grounding", None)
+          try:
+              A.run(path, auto_ontology=ao2, K=M); assert False
+          except RuntimeError:
+              pass
+          dead = json.load(open(os.path.join(M.runs_dir(), [f for f in os.listdir(M.runs_dir()) if f.endswith(".json")][0])))
+          assert dead["status"] == "aborted" and dead["incomplete_reason"] == "RuntimeError: boom" and dead["rounds"] == []
+          for call in (M.run_load, lambda: M.run_round([], dead, incumbent=[])):
+              try:
+                  call(); assert False
+              except SystemExit:
+                  pass
+          assert M.run_extend(dead["run_id"])["status"] == "aborted"
+          try:
+              A.run(path, auto_ontology=ao2, K=M); assert False      # an aborted run holds nothing back…
+          except RuntimeError:
+              pass
+          assert len([f for f in os.listdir(M.runs_dir()) if f.endswith(".json") and ".proposals." not in f]) == 2  # …a new one opens
+          # two runs opened in one second never share a file
+          r1, r2 = M.run_start("first", 1), M.run_start("second", 1)
+          assert r1["run_id"] != r2["run_id"] and M.run_load(r1["run_id"])["hypothesis"] == "first"
           print("auto-ontology adapter: PASS")
           EOF
       - name: bin entry syntax (node --check)
